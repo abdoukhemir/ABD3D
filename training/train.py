@@ -93,9 +93,9 @@ def find_latest_step_checkpoint(checkpoint_dir: Path) -> str | None:
     return str(step_files[0])
 
 
-def create_dataloader(config: Config) -> DataLoader:
+def create_dataset(config: Config):
     from data import CompleteObjaverseDataset
-    dataset = CompleteObjaverseDataset(
+    return CompleteObjaverseDataset(
         config.dataset_name,
         config.dataset_split,
         config.image_size,
@@ -105,6 +105,10 @@ def create_dataloader(config: Config) -> DataLoader:
         num_views=config.num_views,
         checkpoint_dir=config.checkpoint_dir,
     )
+
+
+def get_fresh_dataloader(config: Config) -> DataLoader:
+    dataset = create_dataset(config)
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers)
 
 
@@ -136,22 +140,17 @@ def train(config: Config, resume: str | None = None) -> None:
             print(f"Resumed from checkpoint: {resume_path} at step {start_step}")
 
     model.train(); last_checkpoint = time.monotonic(); optimizer.zero_grad(set_to_none=True)
+    dataloader = get_fresh_dataloader(config)
     iterator = iter(dataloader)
     step = start_step
     while step < config.max_steps:
         try:
             batch = next(iterator)
-        except StopIteration:
-            print("Shard exhausted, reloading dataset...")
-            dataloader = create_dataloader(config)
+        except (StopIteration, RuntimeError):
+            print("Shard done → loading next shard...")
+            dataloader = get_fresh_dataloader(config)
             iterator = iter(dataloader)
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                print("Waiting for next shard to load...")
-                time.sleep(5)
-                iterator = iter(dataloader)
-                continue
+            continue
 
         input_view = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)

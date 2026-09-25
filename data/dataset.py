@@ -269,7 +269,7 @@ class CompleteObjaverseDataset(IterableDataset):
         progress = self.buffer._load_progress()
         shard_index = int(progress.get("current_shard_index", 0))
         if shard_index >= len(self.buffer.shards):
-            raise StopIteration
+            return
 
         self.buffer.current_index = shard_index
         self.buffer.total_processed = int(progress.get("total_shards_processed", 0))
