@@ -171,7 +171,7 @@ class CompleteObjaverseDataset(IterableDataset):
                 views.append(views[-1])
 
             # Yield multiple samples from this object
-            num_samples = max(4, len(views) // self.num_views * 4)
+            num_samples = max(16, len(views) * 4)
             yielded = 0
             for _ in range(num_samples):
                 input_idx = random.randrange(len(views))
