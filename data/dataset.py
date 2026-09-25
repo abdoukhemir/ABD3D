@@ -2,6 +2,7 @@ import io
 import json
 import os
 import random
+import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -13,13 +14,33 @@ from PIL import Image
 from torch.utils.data import IterableDataset
 from torchvision import transforms
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+CACHE_DIR = BASE_DIR / "checkpoints" / "rolling_cache"
+SHARD_DIR = CACHE_DIR / "shards"
+META_DIR = CACHE_DIR / "metadata"
+PROGRESS_FILE = BASE_DIR / "checkpoints" / "shard_progress.json"
+
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SHARD_DIR.mkdir(parents=True, exist_ok=True)
+META_DIR.mkdir(parents=True, exist_ok=True)
+print(f"[ABD3D] BASE_DIR={BASE_DIR}")
+
+
+def resolve_project_path(path: str | Path | None) -> Path:
+    if path is None:
+        return BASE_DIR / "checkpoints"
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (BASE_DIR / candidate).resolve()
+    return candidate.resolve()
+
 
 class ShardBuffer:
     """A bounded rolling shard cache that keeps at most two parquet shards on disk."""
 
-    def __init__(self, repo_id: str, checkpoint_dir: str | Path = "checkpoints"):
+    def __init__(self, repo_id: str, checkpoint_dir: str | Path | None = None):
         self.repo_id = repo_id
-        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir = resolve_project_path(checkpoint_dir)
         self.progress_path = self.checkpoint_dir / "shard_progress.json"
         self.cache_dir = self.checkpoint_dir / "rolling_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -166,7 +187,7 @@ class CompleteObjaverseDataset(IterableDataset):
                  image_size: int = 224, config_name: str | None = None,
                  image_keys: tuple[str, ...] = ("image_png", "image", "render", "front_image"),
                  num_workers: int | None = None, num_views: int = 12,
-                 checkpoint_dir: str | Path = "checkpoints"):
+                 checkpoint_dir: str | Path | None = None):
         super().__init__()
         self.name = name
         self.split = split
@@ -178,7 +199,7 @@ class CompleteObjaverseDataset(IterableDataset):
             num_workers = 0 if os.name == "nt" else 2
         self.num_workers = num_workers
         self.image_size = int(image_size)
-        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir = resolve_project_path(checkpoint_dir)
         self.buffer = ShardBuffer(name, checkpoint_dir=self.checkpoint_dir)
         self.resize = transforms.Resize((self.image_size, self.image_size))
         self.rgb_transform = transforms.Compose([

@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+import sys
 
 import torch
 from torch import nn
@@ -7,6 +8,19 @@ from torch.utils.data import DataLoader
 
 from config import Config
 from models import DiTGenerator, ImageVAE, TriplaneDecoder, ViTEncoder
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+CHECKPOINT_DIR = BASE_DIR / "checkpoints"
+print(f"[ABD3D] BASE_DIR={BASE_DIR}")
+
+
+def resolve_checkpoint_dir(path: str | Path | None) -> Path:
+    if path is None:
+        return CHECKPOINT_DIR
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (BASE_DIR / candidate).resolve()
+    return candidate.resolve()
 
 
 class ABD3DModel(nn.Module):
@@ -80,11 +94,20 @@ def find_latest_step_checkpoint(checkpoint_dir: Path) -> str | None:
 
 
 def train(config: Config, resume: str | None = None) -> None:
+    config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
+    print(f"[ABD3D] training checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     from data import CompleteObjaverseDataset
-    dataset = CompleteObjaverseDataset(config.dataset_name, config.dataset_split, config.image_size,
-                                      config.dataset_config, config.image_keys, num_workers=config.num_workers)
+    dataset = CompleteObjaverseDataset(
+        config.dataset_name,
+        config.dataset_split,
+        config.image_size,
+        config.dataset_config,
+        config.image_keys,
+        num_workers=config.num_workers,
+        checkpoint_dir=config.checkpoint_dir,
+    )
     loader = DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers)
     model = ABD3DModel(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
