@@ -119,6 +119,12 @@ def train(config: Config, resume: str | None = None) -> None:
 
         input_view = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)
+
+        if input_view.dim() > 4 and input_view.shape[1] == 1:
+            input_view = input_view.squeeze(1)
+        if target_views.dim() > 4 and target_views.shape[1] == 1:
+            target_views = target_views.squeeze(1)
+
         with torch.autocast(device_type=device.type, enabled=scaler.is_enabled()):
             output = model(input_view)
             prediction_views = output["predicted_views"]
