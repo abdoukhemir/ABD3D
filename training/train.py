@@ -116,15 +116,21 @@ def get_fresh_dataloader(config: Config) -> DataLoader:
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers)
 
 
-def train(config: Config, resume: str | None = None) -> None:
+def train(config: Config, resume=None) -> None:
     config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
     print(f"[ABD3D] training checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    dataloader = get_fresh_dataloader(config)
+
     model = ABD3DModel(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=config.mixed_precision and device.type == "cuda")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=config.mixed_precision and device.type == "cuda")
+
     lpips_metric = None
     try:
         import lpips
@@ -132,26 +138,39 @@ def train(config: Config, resume: str | None = None) -> None:
         for parameter in lpips_metric.parameters():
             parameter.requires_grad_(False)
     except ImportError:
-        print("LPIPS is unavailable; install the requirements to enable perceptual loss.")
+        print("LPIPS unavailable.")
 
     start_step = 0
     if resume:
-        resume_path = resume if resume else str(find_latest_step_checkpoint(config.checkpoint_dir))
+        resume_path = resume if isinstance(resume, str) else find_latest_step_checkpoint(config.checkpoint_dir)
         if resume_path:
             state = torch.load(resume_path, map_location=device)
-            model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
-            scaler.load_state_dict(state.get("scaler", {})); start_step = state.get("step", 0)
-            print(f"Resumed from checkpoint: {resume_path} at step {start_step}")
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            scaler.load_state_dict(state.get("scaler", {}))
+            start_step = state.get("step", 0)
+            print(f"Resumed from {resume_path} at step {start_step}")
 
-    model.train(); last_checkpoint = time.monotonic(); optimizer.zero_grad(set_to_none=True)
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    last_checkpoint = time.monotonic()
+
     dataloader = get_fresh_dataloader(config)
     iterator = iter(dataloader)
     step = start_step
+
     while step < config.max_steps:
+
+        # ✅ FIX: Catch StopIteration → reload → next shard automatically
         try:
             batch = next(iterator)
-        except (StopIteration, RuntimeError):
-            print("Shard done → loading next shard...")
+        except StopIteration:
+            print(f"[ABD3D] Shard done at step {step} → loading next shard...")
+            dataloader = get_fresh_dataloader(config)
+            iterator = iter(dataloader)
+            continue
+        except Exception as e:
+            print(f"[ABD3D] Batch error: {e} → reloading...")
             dataloader = get_fresh_dataloader(config)
             iterator = iter(dataloader)
             continue
@@ -159,28 +178,41 @@ def train(config: Config, resume: str | None = None) -> None:
         input_view = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)
 
-        if input_view.dim() > 4 and input_view.shape[1] == 1:
+        # ✅ FIX: squeeze only if extra dim exists
+        if input_view.dim() == 5 and input_view.shape[1] == 1:
             input_view = input_view.squeeze(1)
-        if target_views.dim() > 4 and target_views.shape[1] == 1:
+        if target_views.dim() == 5 and target_views.shape[1] == 1:
             target_views = target_views.squeeze(1)
 
         with torch.autocast(device_type=device.type, enabled=scaler.is_enabled()):
             output = model(input_view)
-            prediction_views = output["predicted_views"]
-            reconstruction_loss = nn.functional.mse_loss(prediction_views, target_views)
-            perceptual_loss = _lpips_loss(prediction_views, target_views, lpips_metric)
-            kl_loss = ImageVAE.kl_divergence(output["mu"], output["logvar"])
-            loss = (config.mse_weight * reconstruction_loss + config.lpips_weight * perceptual_loss +
-                    config.kl_weight * kl_loss) / config.gradient_accumulation_steps
+            pred_views = output["predicted_views"]
+            mse = nn.functional.mse_loss(pred_views, target_views)
+            perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
+            kl = ImageVAE.kl_divergence(output["mu"], output["logvar"])
+            loss = (
+                config.mse_weight * mse +
+                config.lpips_weight * perceptual +
+                config.kl_weight * kl
+            ) / config.gradient_accumulation_steps
+
         scaler.scale(loss).backward()
+
         if (step + 1) % config.gradient_accumulation_steps == 0:
-            scaler.unscale_(optimizer); nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-            scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
         if time.monotonic() - last_checkpoint >= config.checkpoint_interval_minutes * 60:
-            save_step_checkpoint(config.checkpoint_dir, model, optimizer, scaler, step + 1, keep_last=3)
+            save_step_checkpoint(config.checkpoint_dir, model, optimizer, scaler, step + 1)
             last_checkpoint = time.monotonic()
-        display_step = step if step < config.max_steps else config.max_steps - 1
-        print(f"Step {display_step}/{max(config.max_steps - 1, 0)} - Loss: {loss.item() * config.gradient_accumulation_steps:.4f}")
+
+        print(f"Step {step}/{config.max_steps - 1} - "
+              f"Loss: {loss.item() * config.gradient_accumulation_steps:.4f} "
+              f"MSE: {mse.item():.4f} KL: {kl.item():.4f}")
         step += 1
+
     save_checkpoint(config.checkpoint_dir / "final.pt", model, optimizer, scaler, config.max_steps)
     print("Training complete!")
