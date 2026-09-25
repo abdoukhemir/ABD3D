@@ -84,13 +84,11 @@ def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
 def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
                          scaler, step: int, keep_last: int = 3) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"step_{step}.pt"
-    save_checkpoint(checkpoint_path, model, optimizer, scaler, step)
-    print(f"[ABD3D] Checkpoint saved at step {step} ✅")
-    # Keep only last N checkpoints
-    files = sorted(
-        checkpoint_dir.glob("step_*.pt"),
-        key=lambda p: p.stat().st_mtime)
+    path = checkpoint_dir / f"step_{step}.pt"
+    save_checkpoint(path, model, optimizer, scaler, step)
+    print(f"[ABD3D] Checkpoint saved: step_{step}.pt ✅")
+    files = sorted(checkpoint_dir.glob("step_*.pt"),
+                   key=lambda p: p.stat().st_mtime)
     while len(files) > keep_last:
         files.pop(0).unlink(missing_ok=True)
 
@@ -98,10 +96,8 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
 def find_latest_step_checkpoint(checkpoint_dir: Path):
     if not checkpoint_dir.exists():
         return None
-    files = sorted(
-        checkpoint_dir.glob("step_*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True)
+    files = sorted(checkpoint_dir.glob("step_*.pt"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
     return str(files[0]) if files else None
 
 
@@ -117,32 +113,32 @@ def get_fresh_dataloader(config: Config) -> DataLoader:
         num_views=config.num_views,
         checkpoint_dir=config.checkpoint_dir,
     )
-    return DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        num_workers=0,
-    )
+    return DataLoader(dataset, batch_size=config.batch_size, num_workers=0)
 
 
 def train(config: Config, resume=None) -> None:
     config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
-    print(f"[ABD3D] training checkpoint_dir={config.checkpoint_dir}")
+    print(f"[ABD3D] checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
 
-    # Force GPU detection
+    # ✅ FIX: Force GPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"[ABD3D] Using GPU: {torch.cuda.get_device_name(0)} ✅")
+        print(f"[ABD3D] GPU: {torch.cuda.get_device_name(0)} "
+              f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB) ✅")
     else:
         device = torch.device("cpu")
-        print("[ABD3D] WARNING: No GPU found — using CPU ⚠️")
+        print("[ABD3D] WARNING: No GPU — using CPU ⚠️")
 
     model = ABD3DModel(config).to(device)
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"[ABD3D] Model: {total_params:.1f}M parameters on {device}")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+        weight_decay=config.weight_decay)
+
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=config.mixed_precision and device.type == "cuda")
@@ -151,23 +147,23 @@ def train(config: Config, resume=None) -> None:
     try:
         import lpips
         lpips_metric = lpips.LPIPS(net="vgg").to(device).eval()
-        for parameter in lpips_metric.parameters():
-            parameter.requires_grad_(False)
+        for p in lpips_metric.parameters():
+            p.requires_grad_(False)
         print("[ABD3D] LPIPS loaded ✅")
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
-    # Checkpoint resume
+    # Resume
     start_step = 0
     if resume:
-        print(f"[ABD3D] Looking for checkpoints in: {config.checkpoint_dir}")
+        print(f"[ABD3D] Searching for checkpoints in: {config.checkpoint_dir}")
         resume_path = find_latest_step_checkpoint(config.checkpoint_dir)
         if resume_path is None:
             final = config.checkpoint_dir / "final.pt"
             if final.exists():
                 resume_path = str(final)
         if resume_path:
-            print(f"[ABD3D] Loading checkpoint: {resume_path}")
+            print(f"[ABD3D] Loading: {resume_path}")
             state = torch.load(resume_path, map_location=device)
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
@@ -175,7 +171,7 @@ def train(config: Config, resume=None) -> None:
             start_step = state.get("step", 0)
             print(f"[ABD3D] Resumed from step {start_step} ✅")
         else:
-            print("[ABD3D] No checkpoint found — starting fresh")
+            print("[ABD3D] No checkpoint found — fresh start")
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -185,59 +181,59 @@ def train(config: Config, resume=None) -> None:
     iterator = iter(dataloader)
     step = start_step
 
-    print(f"[ABD3D] Training from step {step} to {config.max_steps} 🚀")
+    print(f"[ABD3D] Training: step {step} → {config.max_steps} 🚀")
 
     while step < config.max_steps:
 
-        # Get next batch — if shard empty load next shard
         try:
             batch = next(iterator)
+
         except StopIteration:
-            print(f"[ABD3D] Shard done at step {step} → next shard...")
-            dataloader = get_fresh_dataloader(config)
-            iterator = iter(dataloader)
-            continue
-        except Exception as e:
-            print(f"[ABD3D] Batch error: {e} → reloading...")
+            print(f"[ABD3D] Shard done → next shard (step {step})")
             dataloader = get_fresh_dataloader(config)
             iterator = iter(dataloader)
             continue
 
-        input_view = batch["input_view"].to(device, non_blocking=True)
+        except Exception as e:
+            print(f"[ABD3D] Error: {e} → reloading...")
+            dataloader = get_fresh_dataloader(config)
+            iterator = iter(dataloader)
+            continue
+
+        # Move to device
+        input_view   = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)
 
-        # Safety squeeze — remove extra dim if present
+        # Safety squeeze
         if input_view.dim() == 5 and input_view.shape[1] == 1:
             input_view = input_view.squeeze(1)
         if target_views.dim() == 5 and target_views.shape[1] == 1:
             target_views = target_views.squeeze(1)
 
-        # Forward pass
-        with torch.autocast(
-                device_type=device.type,
-                enabled=scaler.is_enabled()):
-            output = model(input_view)
+        # Forward
+        with torch.autocast(device_type=device.type,
+                            enabled=scaler.is_enabled()):
+            output     = model(input_view)
             pred_views = output["predicted_views"]
-            mse = nn.functional.mse_loss(pred_views, target_views)
+            mse        = nn.functional.mse_loss(pred_views, target_views)
             perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
-            kl = ImageVAE.kl_divergence(output["mu"], output["logvar"])
-            loss = (
-                config.mse_weight * mse +
+            kl         = ImageVAE.kl_divergence(output["mu"], output["logvar"])
+            loss       = (
+                config.mse_weight  * mse +
                 config.lpips_weight * perceptual +
-                config.kl_weight * kl
+                config.kl_weight   * kl
             ) / config.gradient_accumulation_steps
 
         scaler.scale(loss).backward()
 
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                model.parameters(), config.grad_clip_norm)
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # Save checkpoint every 30 min
+        # Checkpoint every 30 min
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(
@@ -246,7 +242,7 @@ def train(config: Config, resume=None) -> None:
 
         # Log
         gpu_mem = torch.cuda.memory_reserved() / 1e9 \
-            if device.type == "cuda" else 0
+            if device.type == "cuda" else 0.0
         print(f"Step {step}/{config.max_steps - 1} | "
               f"Loss: {loss.item() * config.gradient_accumulation_steps:.4f} | "
               f"MSE: {mse.item():.4f} | "
@@ -254,8 +250,6 @@ def train(config: Config, resume=None) -> None:
               f"GPU: {gpu_mem:.1f}GB")
         step += 1
 
-    # Save final checkpoint
-    save_checkpoint(
-        config.checkpoint_dir / "final.pt",
-        model, optimizer, scaler, config.max_steps)
+    save_checkpoint(config.checkpoint_dir / "final.pt",
+                    model, optimizer, scaler, config.max_steps)
     print("[ABD3D] Training complete! 🎉")
