@@ -1,0 +1,9 @@
+checkpoints/
+abd3d-env/
+__pycache__/
+*.pyc
+outputs/
+*.pt
+.env
+check_dataset.py
+check_dataset2.py
