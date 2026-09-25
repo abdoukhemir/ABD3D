@@ -93,11 +93,7 @@ def find_latest_step_checkpoint(checkpoint_dir: Path) -> str | None:
     return str(step_files[0])
 
 
-def train(config: Config, resume: str | None = None) -> None:
-    config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
-    print(f"[ABD3D] training checkpoint_dir={config.checkpoint_dir}")
-    torch.manual_seed(config.seed)
-    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+def create_dataloader(config: Config) -> DataLoader:
     from data import CompleteObjaverseDataset
     dataset = CompleteObjaverseDataset(
         config.dataset_name,
@@ -106,9 +102,18 @@ def train(config: Config, resume: str | None = None) -> None:
         config.dataset_config,
         config.image_keys,
         num_workers=config.num_workers,
+        num_views=config.num_views,
         checkpoint_dir=config.checkpoint_dir,
     )
-    loader = DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers)
+    return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers)
+
+
+def train(config: Config, resume: str | None = None) -> None:
+    config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
+    print(f"[ABD3D] training checkpoint_dir={config.checkpoint_dir}")
+    torch.manual_seed(config.seed)
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    dataloader = create_dataloader(config)
     model = ABD3DModel(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=config.mixed_precision and device.type == "cuda")
@@ -131,14 +136,22 @@ def train(config: Config, resume: str | None = None) -> None:
             print(f"Resumed from checkpoint: {resume_path} at step {start_step}")
 
     model.train(); last_checkpoint = time.monotonic(); optimizer.zero_grad(set_to_none=True)
-    iterator = iter(loader)
+    iterator = iter(dataloader)
     step = start_step
     while step < config.max_steps:
         try:
             batch = next(iterator)
         except StopIteration:
-            iterator = iter(loader)
-            batch = next(iterator)
+            print("Shard exhausted, reloading dataset...")
+            dataloader = create_dataloader(config)
+            iterator = iter(dataloader)
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                print("Waiting for next shard to load...")
+                time.sleep(5)
+                iterator = iter(dataloader)
+                continue
 
         input_view = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)

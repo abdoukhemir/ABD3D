@@ -41,8 +41,8 @@ class ShardBuffer:
     def __init__(self, repo_id: str, checkpoint_dir: str | Path | None = None):
         self.repo_id = repo_id
         self.checkpoint_dir = resolve_project_path(checkpoint_dir)
-        self.progress_path = self.checkpoint_dir / "shard_progress.json"
-        self.cache_dir = self.checkpoint_dir / "rolling_cache"
+        self.progress_path = PROGRESS_FILE if checkpoint_dir is None else (self.checkpoint_dir / "shard_progress.json")
+        self.cache_dir = CACHE_DIR if checkpoint_dir is None else (self.checkpoint_dir / "rolling_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.shards = self._list_shards()
         self.progress = self._load_progress()
@@ -266,9 +266,22 @@ class CompleteObjaverseDataset(IterableDataset):
         if not self.buffer.shards:
             raise ValueError(f"No parquet shards were found in the dataset '{self.name}'.")
 
-        current_path = self.buffer.open_current_shard()
+        progress = self.buffer._load_progress()
+        shard_index = int(progress.get("current_shard_index", 0))
+        if shard_index >= len(self.buffer.shards):
+            raise StopIteration
+
+        self.buffer.current_index = shard_index
+        self.buffer.total_processed = int(progress.get("total_shards_processed", 0))
+        self.buffer.completed = set(progress.get("completed_shards", []))
+        self.buffer._current_name = self.buffer.shards[shard_index]
+        self.buffer._save_progress()
+
+        current_path = self.buffer._download_shard(self.buffer.shards[shard_index])
+        self.buffer.current_path = current_path
         self.buffer._start_next_download()
-        while current_path is not None:
+
+        try:
             dataframe = pd.read_parquet(current_path)
             grouped: dict[str, list[dict]] = {}
             for row_index, row in dataframe.iterrows():
@@ -278,10 +291,15 @@ class CompleteObjaverseDataset(IterableDataset):
             for rows in grouped.values():
                 for sample in self._build_object_samples(rows):
                     yield sample
-
+        finally:
+            next_index = (shard_index + 1) % len(self.buffer.shards)
+            self.buffer.current_index = next_index
+            self.buffer.total_processed += 1
+            self.buffer.completed.add(self.buffer.shards[shard_index])
+            self.buffer._current_name = self.buffer.shards[next_index]
+            self.buffer._save_progress()
             self.buffer._delete_if_exists(current_path)
-            current_path = self.buffer.advance()
-            self.buffer._start_next_download()
+            self.buffer.current_path = None
 
 
 ObjaverseStreamingDataset = CompleteObjaverseDataset
