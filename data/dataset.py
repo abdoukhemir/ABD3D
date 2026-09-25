@@ -16,8 +16,8 @@ from torchvision import transforms
 BASE_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = BASE_DIR / "checkpoints" / "rolling_cache"
 SHARD_DIR = CACHE_DIR / "shards"
-META_DIR = CACHE_DIR / "metadata"
-PROGRESS_FILE = BASE_DIR / "checkpoints" / "shard_progress.json"
+META_DIR  = CACHE_DIR / "metadata"
+PROGRESS_FILE   = BASE_DIR / "checkpoints" / "shard_progress.json"
 SHARD_LIST_FILE = BASE_DIR / "checkpoints" / "shard_list.json"
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,33 +36,32 @@ def resolve_project_path(path) -> Path:
 
 
 class ShardBuffer:
-    """A bounded rolling shard cache that keeps at most two parquet shards on disk."""
+    """Rolling shard cache — max 2 shards on disk at any time."""
 
     def __init__(self, repo_id: str, checkpoint_dir=None):
         self.repo_id = repo_id
         self.checkpoint_dir = resolve_project_path(checkpoint_dir)
-        self.progress_path = PROGRESS_FILE if checkpoint_dir is None else (self.checkpoint_dir / "shard_progress.json")
-        self.cache_dir = CACHE_DIR if checkpoint_dir is None else (self.checkpoint_dir / "rolling_cache")
+        self.progress_path = PROGRESS_FILE
+        self.cache_dir = CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.shards = self._list_shards()
         self.progress = self._load_progress()
         self.current_index = int(self.progress.get("current_shard_index", 0))
         self.total_processed = int(self.progress.get("total_shards_processed", 0))
-        self.completed = set(self.progress.get("completed_shards", []))
         self.current_path: Path | None = None
         self.next_path: Path | None = None
         self._download_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._download_ready = threading.Event()
         self._current_name: str | None = None
-        self._next_name: str | None = None
         self._save_progress()
 
     def _list_shards(self) -> list:
-        # FIX 1: Load from local cache — NEVER call HF API more than once
+        # Load from local cache — NEVER call HF API more than once
         if SHARD_LIST_FILE.exists():
             try:
-                data = json.loads(SHARD_LIST_FILE.read_text(encoding="utf-8"))
+                data = json.loads(
+                    SHARD_LIST_FILE.read_text(encoding="utf-8"))
                 if isinstance(data, list) and len(data) > 0:
                     print(f"[ABD3D] Loaded {len(data)} shards from local cache ✅")
                     return data
@@ -71,39 +70,35 @@ class ShardBuffer:
 
         print("[ABD3D] Fetching shard list from HuggingFace (first time only)...")
         api = HfApi()
-        files = api.list_repo_files(repo_id=self.repo_id, repo_type="dataset")
+        files = api.list_repo_files(
+            repo_id=self.repo_id, repo_type="dataset")
         shards = sorted(
-            path for path in files
-            if path.endswith(".parquet") and "dome_objaverse" in path
+            f for f in files
+            if f.endswith(".parquet") and "dome_objaverse" in f
         )
         SHARD_LIST_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SHARD_LIST_FILE.write_text(json.dumps(shards, indent=2), encoding="utf-8")
+        SHARD_LIST_FILE.write_text(
+            json.dumps(shards, indent=2), encoding="utf-8")
         print(f"[ABD3D] Found {len(shards)} shards — saved to local cache ✅")
         return shards
 
     def _load_progress(self) -> dict:
         if not self.progress_path.exists():
-            return {"current_shard_index": 0, "total_shards_processed": 0, "completed_shards": [], "last_shard": None}
+            return {"current_shard_index": 0, "total_shards_processed": 0}
         try:
-            data = json.loads(self.progress_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {"current_shard_index": 0, "total_shards_processed": 0, "completed_shards": [], "last_shard": None}
-        return {
-            "current_shard_index": int(data.get("current_shard_index", 0)),
-            "total_shards_processed": int(data.get("total_shards_processed", 0)),
-            "completed_shards": data.get("completed_shards", []),
-            "last_shard": data.get("last_shard"),
-        }
+            return json.loads(self.progress_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"current_shard_index": 0, "total_shards_processed": 0}
 
     def _save_progress(self) -> None:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "current_shard_index": self.current_index,
             "total_shards_processed": self.total_processed,
-            "completed_shards": sorted(self.completed),
             "last_shard": self._current_name,
         }
-        self.progress_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.progress_path.write_text(
+            json.dumps(payload, indent=2), encoding="utf-8")
 
     def _download_shard(self, shard_name: str) -> Path:
         local_path = hf_hub_download(
@@ -126,10 +121,7 @@ class ShardBuffer:
             return
         next_index = (self.current_index + 1) % len(self.shards)
         next_name = self.shards[next_index]
-        if self.next_path is not None and self.next_path.name == Path(next_name).name:
-            return
         self._download_ready.clear()
-        self._next_name = next_name
 
         def worker() -> None:
             try:
@@ -151,173 +143,143 @@ class ShardBuffer:
             return self.next_path
         return None
 
-    def open_current_shard(self) -> Path:
+    def get_current_shard(self) -> Path:
         if self.current_index >= len(self.shards):
             self.current_index = 0
-
-        current_name = self.shards[self.current_index]
-        self._current_name = current_name
+        shard_name = self.shards[self.current_index]
+        self._current_name = shard_name
         self._save_progress()
-        self.current_path = self._download_shard(current_name)
-        return self.current_path
-
-    def advance(self) -> Path | None:
-        self._delete_if_exists(self.current_path)
-        self.current_path = None
-        self.total_processed += 1
-        self.completed.add(self.shards[self.current_index])
-        self.current_index = (self.current_index + 1) % len(self.shards)
-        self._save_progress()
-        total = len(self.shards)
-        print(f"[ABD3D] Moving to shard {self.current_index}/{total} "
-              f"({self.total_processed} total processed)")
-
-        next_ready = self._wait_for_next_shard()
-        if next_ready is not None:
-            self.current_path = next_ready
-            self._current_name = self.shards[self.current_index]
-            self._save_progress()
-            self.next_path = None
-            self._start_next_download()
-            return self.current_path
-
-        self.current_path = self._download_shard(self.shards[self.current_index])
-        self._current_name = self.shards[self.current_index]
-        self._save_progress()
+        self.current_path = self._download_shard(shard_name)
         self._start_next_download()
         return self.current_path
 
+    def advance(self) -> None:
+        self._delete_if_exists(self.current_path)
+        self.current_path = None
+        self.total_processed += 1
+        self.current_index = (self.current_index + 1) % len(self.shards)
+        self._save_progress()
+        print(f"[ABD3D] Shard {self.current_index}/{len(self.shards)} "
+              f"({self.total_processed} total processed) ✅")
+
 
 class CompleteObjaverseDataset(IterableDataset):
-    def __init__(self, name="zeyuanyin/complete-objaverse", split="train",
-                 image_size=224, config_name=None,
-                 image_keys=("image_png", "image", "render", "front_image"),
-                 num_workers=None, num_views=12, checkpoint_dir=None):
+    """
+    Streams zeyuanyin/complete-objaverse using a rolling shard cache.
+    Each parquet file = 1 object = 48 views (view_id 0-47).
+    Yields: input_view [3,H,W], target_views [11,3,H,W], depth_maps [12,3,H,W]
+    """
+
+    def __init__(
+        self,
+        name: str = "zeyuanyin/complete-objaverse",
+        split: str = "train",
+        image_size: int = 224,
+        config_name=None,
+        image_keys=("image_png",),
+        num_workers=None,
+        num_views: int = 12,
+        checkpoint_dir=None,
+    ):
         super().__init__()
         self.name = name
         self.split = split
-        self.config_name = config_name
-        self.image_keys = image_keys
         self.num_views = max(2, int(num_views))
-        self.num_target_views = max(self.num_views - 1, 1)
-        if num_workers is None:
-            num_workers = 0 if os.name == "nt" else 2
-        self.num_workers = num_workers
+        self.num_target_views = self.num_views - 1
         self.image_size = int(image_size)
         self.checkpoint_dir = resolve_project_path(checkpoint_dir)
+        # Always 0 for IterableDataset — avoids multiprocessing issues
+        self.num_workers = 0
         self.buffer = ShardBuffer(name, checkpoint_dir=self.checkpoint_dir)
         self.resize = transforms.Resize((self.image_size, self.image_size))
-        self.rgb_transform = transforms.Compose([
+        self.to_tensor = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5,) * 3, (0.5,) * 3),
         ])
 
-    def _decode_bytes_to_tensor(self, payload) -> torch.Tensor | None:
+    def _decode(self, payload) -> torch.Tensor | None:
         if payload is None:
             return None
         try:
-            image = Image.open(io.BytesIO(payload))
+            img = Image.open(io.BytesIO(payload))
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            img = self.resize(img)
+            return self.to_tensor(img)
         except Exception:
             return None
-        if image.mode not in {"RGB", "RGBA"}:
-            try:
-                image = image.convert("RGB")
-            except Exception:
-                return None
-        if image.mode == "RGBA":
-            image = image.convert("RGB")
-        image = self.resize(image)
-        return self.rgb_transform(image)
-
-    def _infer_object_id(self, row: dict, fallback: int) -> str:
-        for key in ("object_id", "uid", "id", "sample_id", "asset_id", "model_id", "hash"):
-            value = row.get(key)
-            if value is not None:
-                return str(value)
-        return f"row_{fallback}"
-
-    def _build_object_samples(self, rows: list) -> Iterator:
-        views = []
-        for row in rows:
-            image = self._decode_bytes_to_tensor(row.get("image_png"))
-            depth = self._decode_bytes_to_tensor(row.get("nd_png"))
-            if image is not None and depth is not None:
-                views.append({"image": image, "depth": depth})
-
-        if len(views) < 2:
-            return
-
-        while len(views) < self.num_views:
-            views.append(views[-1])
-
-        for start in range(0, len(views), self.num_views):
-            chunk = views[start:start + self.num_views]
-            if len(chunk) < 2:
-                continue
-            while len(chunk) < self.num_views:
-                chunk.append(chunk[-1])
-
-            input_index = random.randrange(len(chunk))
-            target_indices = [idx for idx in range(len(chunk)) if idx != input_index]
-            if len(target_indices) < self.num_target_views:
-                target_indices = target_indices + random.choices(
-                    target_indices, k=self.num_target_views - len(target_indices))
-            else:
-                target_indices = random.sample(target_indices, self.num_target_views)
-
-            # FIX 2: NO unsqueeze(0) here — let DataLoader add batch dim
-            input_view = chunk[input_index]["image"]
-            target_views = torch.stack([chunk[idx]["image"] for idx in target_indices], dim=0)
-            depth_maps = torch.stack([chunk[idx]["depth"] for idx in [input_index, *target_indices]], dim=0)
-
-            yield {
-                "input_view": input_view,
-                "target_views": target_views,
-                "depth_maps": depth_maps,
-            }
 
     def __iter__(self) -> Iterator:
         if not self.buffer.shards:
-            raise ValueError(f"No parquet shards found in dataset '{self.name}'.")
+            raise ValueError(f"No shards found for dataset '{self.name}'")
 
-        progress = self.buffer._load_progress()
-        shard_index = int(progress.get("current_shard_index", 0))
-        if shard_index >= len(self.buffer.shards):
-            shard_index = 0
-
-        self.buffer.current_index = shard_index
-        self.buffer.total_processed = int(progress.get("total_shards_processed", 0))
-        self.buffer.completed = set(progress.get("completed_shards", []))
-        self.buffer._current_name = self.buffer.shards[shard_index]
-        self.buffer._save_progress()
-
-        current_path = self.buffer._download_shard(self.buffer.shards[shard_index])
-        self.buffer.current_path = current_path
-        self.buffer._start_next_download()
+        # Download current shard
+        current_path = self.buffer.get_current_shard()
 
         try:
-            dataframe = pd.read_parquet(current_path)
-            grouped: dict = {}
-            for row_index, row in dataframe.iterrows():
-                object_key = self._infer_object_id(row.to_dict(), row_index)
-                grouped.setdefault(str(object_key), []).append(row.to_dict())
+            df = pd.read_parquet(current_path)
 
-            for rows in grouped.values():
-                yield from self._build_object_samples(rows)
+            # Sort by view_id — entire file is ONE object
+            if "view_id" in df.columns:
+                df = df.sort_values("view_id").reset_index(drop=True)
+
+            # Decode all views in this shard
+            views = []
+            for _, row in df.iterrows():
+                img = self._decode(row.get("image_png"))
+                dep = self._decode(row.get("nd_png"))
+                if img is not None and dep is not None:
+                    views.append({"image": img, "depth": dep})
+
+            print(f"[ABD3D] Shard has {len(views)} valid views")
+
+            if len(views) < 2:
+                return
+
+            # Pad views if fewer than num_views
+            while len(views) < self.num_views:
+                views.append(views[-1])
+
+            # Yield multiple training samples from this object
+            num_samples = max(1, len(views) // self.num_views)
+            for _ in range(num_samples):
+                # Pick random input view
+                input_idx = random.randrange(len(views))
+
+                # Pick random target views (different from input)
+                all_indices = list(range(len(views)))
+                all_indices.remove(input_idx)
+                target_idxs = random.sample(
+                    all_indices,
+                    min(self.num_target_views, len(all_indices))
+                )
+
+                # Pad targets if needed
+                while len(target_idxs) < self.num_target_views:
+                    target_idxs.append(target_idxs[-1])
+
+                input_view = views[input_idx]["image"]
+                target_views = torch.stack(
+                    [views[i]["image"] for i in target_idxs])
+                depth_maps = torch.stack(
+                    [views[i]["depth"] for i in [input_idx, *target_idxs]])
+
+                yield {
+                    "input_view": input_view,     # [3, H, W]
+                    "target_views": target_views,  # [11, 3, H, W]
+                    "depth_maps": depth_maps,      # [12, 3, H, W]
+                }
 
         except Exception as e:
             print(f"[ABD3D] Error reading shard: {e}")
 
         finally:
-            # FIX 3: Always advance shard in finally — never raise StopIteration
-            next_index = (shard_index + 1) % len(self.buffer.shards)
-            self.buffer.current_index = next_index
-            self.buffer.total_processed += 1
-            self.buffer.completed.add(self.buffer.shards[shard_index])
-            self.buffer._current_name = self.buffer.shards[next_index]
-            self.buffer._save_progress()
-            self.buffer._delete_if_exists(current_path)
-            self.buffer.current_path = None
+            # Always advance — never crash
+            self.buffer.advance()
 
 
+# Alias for backwards compatibility
 ObjaverseStreamingDataset = CompleteObjaverseDataset
+ShapeNetStreamingDataset = CompleteObjaverseDataset
