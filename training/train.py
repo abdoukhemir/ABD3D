@@ -107,6 +107,10 @@ def create_dataset(config: Config):
     )
 
 
+def create_dataloader(config: Config) -> DataLoader:
+    return get_fresh_dataloader(config)
+
+
 def get_fresh_dataloader(config: Config) -> DataLoader:
     dataset = create_dataset(config)
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers)
@@ -117,7 +121,7 @@ def train(config: Config, resume: str | None = None) -> None:
     print(f"[ABD3D] training checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    dataloader = create_dataloader(config)
+    dataloader = get_fresh_dataloader(config)
     model = ABD3DModel(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=config.mixed_precision and device.type == "cuda")
