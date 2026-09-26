@@ -1,6 +1,4 @@
 import shutil
-
-...
 import time
 from pathlib import Path
 
@@ -78,7 +76,6 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
 
 def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # ✅ Handle DataParallel — save underlying model not wrapper
     model_state = model.module.state_dict() \
         if isinstance(model, nn.DataParallel) \
         else model.state_dict()
@@ -97,29 +94,47 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
     save_checkpoint(path, model, optimizer, scaler, step)
     print(f"[ABD3D] Checkpoint saved: step_{step}.pt ✅")
 
-    # ✅ Auto-copy to permanent output (survives session end)
+    # Auto-backup to permanent storage (survives session end)
     permanent = Path("/kaggle/working/abd3d-checkpoints")
-    if permanent.parent.exists():  # only on Kaggle
+    if permanent.parent.exists():
         permanent.mkdir(parents=True, exist_ok=True)
+
+        # Save checkpoint
         shutil.copy(path, permanent / f"step_{step}.pt")
-        
-        # Also save shard progress
-        progress = checkpoint_dir / "shard_progress.json"
-        if progress.exists():
-            shutil.copy(progress, permanent / "shard_progress.json")
-        
-        # Also save shard list
-        shard_list = checkpoint_dir / "shard_list.json"
-        if shard_list.exists():
-            shutil.copy(shard_list, permanent / "shard_list.json")
-            
-        print(f"[ABD3D] Checkpoint backed up to permanent storage ✅")
+
+        # Save shard progress
+        for f in [
+            checkpoint_dir / "shard_progress.json",
+            BASE_DIR / "checkpoints" / "shard_progress.json",
+        ]:
+            if f.exists():
+                shutil.copy(f, permanent / "shard_progress.json")
+                break
+
+        # Save shard list
+        # Save shard list
+        for f in [
+            checkpoint_dir / "shard_list.json",
+            BASE_DIR / "checkpoints" / "shard_list.json",
+        ]:
+            if f.exists():
+                shutil.copy(f, permanent / "shard_list.json")
+                break
+
+        # ✅ Backup VGG16 — never download again
+        vgg = Path('/kaggle/working/torch_cache/hub/checkpoints/vgg16-397923af.pth')
+        if vgg.exists() and not (permanent / 'vgg16-397923af.pth').exists():
+            shutil.copy(vgg, permanent / 'vgg16-397923af.pth')
+            print("[ABD3D] VGG16 backed up ✅")
+
+        print(f"[ABD3D] Backed up to permanent storage ✅")
 
     # Keep only last N checkpoints locally
     files = sorted(checkpoint_dir.glob("step_*.pt"),
                    key=lambda p: p.stat().st_mtime)
     while len(files) > keep_last:
         files.pop(0).unlink(missing_ok=True)
+
 
 def find_latest_step_checkpoint(checkpoint_dir: Path):
     if not checkpoint_dir.exists():
@@ -149,7 +164,7 @@ def train(config: Config, resume=None) -> None:
     print(f"[ABD3D] checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
 
-    # ✅ GPU Setup
+    # GPU Setup
     if torch.cuda.is_available():
         device = torch.device("cuda")
         num_gpus = torch.cuda.device_count()
@@ -163,18 +178,18 @@ def train(config: Config, resume=None) -> None:
         num_gpus = 0
         print("[ABD3D] WARNING: No GPU — using CPU ⚠️")
 
-    # ✅ Build model
+    # Build model
     base_model = ABD3DModel(config).to(device)
     total_params = sum(p.numel() for p in base_model.parameters()) / 1e6
     print(f"[ABD3D] Model: {total_params:.1f}M parameters")
 
-    # ✅ Wrap with DataParallel if multiple GPUs
+    # Wrap with DataParallel if multiple GPUs
     if num_gpus > 1:
         model = nn.DataParallel(base_model)
-        print(f"[ABD3D] Using DataParallel across {num_gpus} GPUs 🔥")
+        print(f"[ABD3D] DataParallel across {num_gpus} GPUs 🔥")
     else:
         model = base_model
-        print(f"[ABD3D] Using single GPU")
+        print(f"[ABD3D] Single GPU")
 
     optimizer = torch.optim.AdamW(
         base_model.parameters(),
@@ -185,17 +200,18 @@ def train(config: Config, resume=None) -> None:
         "cuda",
         enabled=config.mixed_precision and device.type == "cuda")
 
+    # LPIPS — kept on CPU to avoid GPU 0 overload with DataParallel
     lpips_metric = None
     try:
         import lpips
         lpips_metric = lpips.LPIPS(net="vgg").eval()
         for p in lpips_metric.parameters():
             p.requires_grad_(False)
-        print("[ABD3D] LPIPS loaded ✅")
+        print("[ABD3D] LPIPS loaded on CPU ✅")
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
-    # ✅ Resume
+    # Resume
     start_step = 0
     if resume:
         print(f"[ABD3D] Searching checkpoints in: {config.checkpoint_dir}")
@@ -207,14 +223,13 @@ def train(config: Config, resume=None) -> None:
         if resume_path:
             print(f"[ABD3D] Loading: {resume_path}")
             state = torch.load(resume_path, map_location=device)
-            # ✅ Load into base_model (not DataParallel wrapper)
             base_model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
             scaler.load_state_dict(state.get("scaler", {}))
             start_step = state.get("step", 0)
             print(f"[ABD3D] Resumed from step {start_step} ✅")
         else:
-            print("[ABD3D] No checkpoint found — fresh start")
+            print("[ABD3D] No checkpoint — fresh start")
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -272,13 +287,14 @@ def train(config: Config, resume=None) -> None:
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
+        # Checkpoint every 30 min
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(
                 config.checkpoint_dir, model, optimizer, scaler, step + 1)
             last_checkpoint = time.monotonic()
 
-        # ✅ Log total GPU memory across all GPUs
+        # Log
         gpu_mem = sum(
             torch.cuda.memory_reserved(i) / 1e9
             for i in range(num_gpus)
