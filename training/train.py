@@ -1,3 +1,6 @@
+import shutil
+
+...
 import time
 from pathlib import Path
 
@@ -93,11 +96,30 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
     path = checkpoint_dir / f"step_{step}.pt"
     save_checkpoint(path, model, optimizer, scaler, step)
     print(f"[ABD3D] Checkpoint saved: step_{step}.pt ✅")
+
+    # ✅ Auto-copy to permanent output (survives session end)
+    permanent = Path("/kaggle/working/abd3d-checkpoints")
+    if permanent.parent.exists():  # only on Kaggle
+        permanent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(path, permanent / f"step_{step}.pt")
+        
+        # Also save shard progress
+        progress = checkpoint_dir / "shard_progress.json"
+        if progress.exists():
+            shutil.copy(progress, permanent / "shard_progress.json")
+        
+        # Also save shard list
+        shard_list = checkpoint_dir / "shard_list.json"
+        if shard_list.exists():
+            shutil.copy(shard_list, permanent / "shard_list.json")
+            
+        print(f"[ABD3D] Checkpoint backed up to permanent storage ✅")
+
+    # Keep only last N checkpoints locally
     files = sorted(checkpoint_dir.glob("step_*.pt"),
                    key=lambda p: p.stat().st_mtime)
     while len(files) > keep_last:
         files.pop(0).unlink(missing_ok=True)
-
 
 def find_latest_step_checkpoint(checkpoint_dir: Path):
     if not checkpoint_dir.exists():
