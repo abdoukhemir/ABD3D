@@ -70,7 +70,6 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
         target.mul(2).sub(1)
     ).mean()
 
-
 def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # ✅ Handle DataParallel — save underlying model not wrapper
