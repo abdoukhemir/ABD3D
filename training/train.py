@@ -73,8 +73,12 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
 
 def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # ✅ Handle DataParallel — save underlying model not wrapper
+    model_state = model.module.state_dict() \
+        if isinstance(model, nn.DataParallel) \
+        else model.state_dict()
     torch.save({
-        "model": model.state_dict(),
+        "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "step": step,
@@ -121,21 +125,35 @@ def train(config: Config, resume=None) -> None:
     print(f"[ABD3D] checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
 
-    # ✅ FIX: Force GPU
+    # ✅ GPU Setup
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"[ABD3D] GPU: {torch.cuda.get_device_name(0)} "
-              f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB) ✅")
+        num_gpus = torch.cuda.device_count()
+        for i in range(num_gpus):
+            name = torch.cuda.get_device_name(i)
+            mem  = torch.cuda.get_device_properties(i).total_memory / 1e9
+            print(f"[ABD3D] GPU {i}: {name} ({mem:.1f}GB) ✅")
+        print(f"[ABD3D] Total GPUs: {num_gpus} 🔥")
     else:
         device = torch.device("cpu")
+        num_gpus = 0
         print("[ABD3D] WARNING: No GPU — using CPU ⚠️")
 
-    model = ABD3DModel(config).to(device)
-    total_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"[ABD3D] Model: {total_params:.1f}M parameters on {device}")
+    # ✅ Build model
+    base_model = ABD3DModel(config).to(device)
+    total_params = sum(p.numel() for p in base_model.parameters()) / 1e6
+    print(f"[ABD3D] Model: {total_params:.1f}M parameters")
+
+    # ✅ Wrap with DataParallel if multiple GPUs
+    if num_gpus > 1:
+        model = nn.DataParallel(base_model)
+        print(f"[ABD3D] Using DataParallel across {num_gpus} GPUs 🔥")
+    else:
+        model = base_model
+        print(f"[ABD3D] Using single GPU")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        base_model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay)
 
@@ -153,10 +171,10 @@ def train(config: Config, resume=None) -> None:
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
-    # Resume
+    # ✅ Resume
     start_step = 0
     if resume:
-        print(f"[ABD3D] Searching for checkpoints in: {config.checkpoint_dir}")
+        print(f"[ABD3D] Searching checkpoints in: {config.checkpoint_dir}")
         resume_path = find_latest_step_checkpoint(config.checkpoint_dir)
         if resume_path is None:
             final = config.checkpoint_dir / "final.pt"
@@ -165,7 +183,8 @@ def train(config: Config, resume=None) -> None:
         if resume_path:
             print(f"[ABD3D] Loading: {resume_path}")
             state = torch.load(resume_path, map_location=device)
-            model.load_state_dict(state["model"])
+            # ✅ Load into base_model (not DataParallel wrapper)
+            base_model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
             scaler.load_state_dict(state.get("scaler", {}))
             start_step = state.get("step", 0)
@@ -187,30 +206,25 @@ def train(config: Config, resume=None) -> None:
 
         try:
             batch = next(iterator)
-
         except StopIteration:
             print(f"[ABD3D] Shard done → next shard (step {step})")
             dataloader = get_fresh_dataloader(config)
             iterator = iter(dataloader)
             continue
-
         except Exception as e:
             print(f"[ABD3D] Error: {e} → reloading...")
             dataloader = get_fresh_dataloader(config)
             iterator = iter(dataloader)
             continue
 
-        # Move to device
         input_view   = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)
 
-        # Safety squeeze
         if input_view.dim() == 5 and input_view.shape[1] == 1:
             input_view = input_view.squeeze(1)
         if target_views.dim() == 5 and target_views.shape[1] == 1:
             target_views = target_views.squeeze(1)
 
-        # Forward
         with torch.autocast(device_type=device.type,
                             enabled=scaler.is_enabled()):
             output     = model(input_view)
@@ -228,21 +242,24 @@ def train(config: Config, resume=None) -> None:
 
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+            nn.utils.clip_grad_norm_(
+                base_model.parameters(), config.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # Checkpoint every 30 min
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(
                 config.checkpoint_dir, model, optimizer, scaler, step + 1)
             last_checkpoint = time.monotonic()
 
-        # Log
-        gpu_mem = torch.cuda.memory_reserved() / 1e9 \
-            if device.type == "cuda" else 0.0
+        # ✅ Log total GPU memory across all GPUs
+        gpu_mem = sum(
+            torch.cuda.memory_reserved(i) / 1e9
+            for i in range(num_gpus)
+        ) if num_gpus > 0 else 0.0
+
         print(f"Step {step}/{config.max_steps - 1} | "
               f"Loss: {loss.item() * config.gradient_accumulation_steps:.4f} | "
               f"MSE: {mse.item():.4f} | "
