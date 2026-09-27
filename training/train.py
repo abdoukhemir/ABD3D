@@ -64,8 +64,9 @@ class ABD3DModel(nn.Module):
 def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     if metric is None:
         return torch.zeros((), device=prediction.device)
-    prediction = prediction.detach().reshape(-1, *prediction.shape[-3:])
-    target = target.detach().reshape(-1, *target.shape[-3:])
+    # ✅ Cast to float32 for LPIPS
+    prediction = prediction.detach().float().reshape(-1, *prediction.shape[-3:])
+    target = target.detach().float().reshape(-1, *target.shape[-3:])
     loss = metric(
         prediction.mul(2).sub(1),
         target.mul(2).sub(1)
