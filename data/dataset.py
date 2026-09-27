@@ -2,13 +2,12 @@ import io
 import json
 import os
 import random
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pandas as pd
 import torch
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from torch.utils.data import IterableDataset
 from torchvision import transforms
@@ -75,34 +74,27 @@ def _save_progress(index: int, total: int, name: str) -> None:
 
 def _download_shard_wget(repo_id: str, shard_name: str) -> Path:
     """
-    Download shard using wget — reliable in ALL Kaggle modes.
-    hf_hub_download hangs in commit mode ❌
-    wget works perfectly ✅
+    Download shard using the Hugging Face hub API.
     """
     local_path = CACHE_DIR / Path(shard_name).name
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # If already exists — skip download
     if local_path.exists():
         print(f"[ABD3D] Shard already cached ✅")
         return local_path
 
-    token = os.environ.get('HF_TOKEN', '')
-    url = (f"https://huggingface.co/datasets/{repo_id}"
-           f"/resolve/main/{shard_name}")
-
     print(f"[ABD3D] Downloading: {shard_name}")
-    result = subprocess.run([
-        'wget',
-        '--header', f'Authorization: Bearer {token}',
-        '-q',
-        '--show-progress',
-        '-O', str(local_path),
-        url
-    ], capture_output=False)
+    downloaded = Path(
+        hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=shard_name,
+        )
+    )
 
-    if result.returncode != 0 or not local_path.exists():
-        raise RuntimeError(f"wget failed for {shard_name}")
+    if downloaded != local_path:
+        local_path.write_bytes(downloaded.read_bytes())
+        downloaded.unlink(missing_ok=True)
 
     print(f"[ABD3D] Downloaded to: {local_path}")
     return local_path

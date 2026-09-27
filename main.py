@@ -29,11 +29,11 @@ def main() -> None:
                         help="Generate random synthetic images instead of loading the real dataset.")
     args = parser.parse_args()
     config = DEFAULT_CONFIG
+    config.apply_memory_budget()
     if args.steps is not None:
         config.max_steps = args.steps
     if args.batch_size is not None:
         config.batch_size = args.batch_size
-    config.apply_memory_budget()
 
     resume_path = None
     if args.resume:

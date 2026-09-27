@@ -64,14 +64,13 @@ class ABD3DModel(nn.Module):
 def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     if metric is None:
         return torch.zeros((), device=prediction.device)
-    orig_device = prediction.device
-    prediction = prediction.detach().cpu().reshape(-1, *prediction.shape[-3:])
-    target = target.detach().cpu().reshape(-1, *target.shape[-3:])
-    loss = metric.cpu()(
+    prediction = prediction.detach().reshape(-1, *prediction.shape[-3:])
+    target = target.detach().reshape(-1, *target.shape[-3:])
+    loss = metric(
         prediction.mul(2).sub(1),
         target.mul(2).sub(1)
     ).mean()
-    return loss.to(orig_device)
+    return loss
 
 
 def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
@@ -204,10 +203,10 @@ def train(config: Config, resume=None) -> None:
     lpips_metric = None
     try:
         import lpips
-        lpips_metric = lpips.LPIPS(net="vgg").eval()
+        lpips_metric = lpips.LPIPS(net="vgg").to(device).eval()
         for p in lpips_metric.parameters():
             p.requires_grad_(False)
-        print("[ABD3D] LPIPS loaded on CPU ✅")
+        print("[ABD3D] LPIPS loaded on GPU ✅")
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
@@ -287,7 +286,7 @@ def train(config: Config, resume=None) -> None:
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # Checkpoint every 30 min
+        # Checkpoint every 10 min
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(

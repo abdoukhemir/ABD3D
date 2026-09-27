@@ -18,7 +18,7 @@ class Config:
     generator_heads: int = 8
     triplane_channels: int = 32
     triplane_size: int = 32
-    batch_size: int = 4
+    batch_size: int = 5
     gradient_accumulation_steps: int = 2
     num_workers: int = 0 if os.name == "nt" else 2
     max_steps: int = 100_000
@@ -29,7 +29,7 @@ class Config:
     mse_weight: float = 1.0
     lpips_weight: float = 0.1
     kl_weight: float = 1e-5
-    checkpoint_interval_minutes: int = 30
+    checkpoint_interval_minutes: int = 10
     checkpoint_dir: Path = Path("checkpoints")
     dataset_name: str = "zeyuanyin/complete-objaverse"
     dataset_config: str | None = None
