@@ -1,3 +1,4 @@
+import os
 import shutil
 import time
 from pathlib import Path
@@ -65,14 +66,13 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     if metric is None:
         return torch.zeros((), device=prediction.device)
     orig_device = prediction.device
-    # ✅ float32 for LPIPS — must be outside autocast
     prediction = prediction.detach().float().reshape(-1, *prediction.shape[-3:])
     target = target.detach().float().reshape(-1, *target.shape[-3:])
     loss = metric(
         prediction.mul(2).sub(1),
         target.mul(2).sub(1)
     ).mean()
-    return loss.to(orig_device)  # ✅ return to original device
+    return loss.to(orig_device)
 
 
 def save_checkpoint(path: Path, model, optimizer, scaler, scheduler, step: int) -> None:
@@ -99,7 +99,6 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
     permanent = Path("/kaggle/working/abd3d-checkpoints")
     permanent.mkdir(parents=True, exist_ok=True)
 
-    # ✅ Delete old checkpoints from permanent first
     for old in permanent.glob("step_*.pt"):
         old.unlink(missing_ok=True)
 
@@ -208,6 +207,29 @@ def train(config: Config, resume=None) -> None:
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
+    # ✅ WandB Init
+    try:
+        import wandb
+        wandb.init(
+            project="ABD3D",
+            name=f"session-step-{resume or 0}",
+            config={
+                "batch_size":    config.batch_size,
+                "learning_rate": config.learning_rate,
+                "num_views":     config.num_views,
+                "mse_weight":    config.mse_weight,
+                "lpips_weight":  config.lpips_weight,
+                "kl_weight":     config.kl_weight,
+                "image_size":    config.image_size,
+            },
+            resume="allow",
+        )
+        use_wandb = True
+        print("[ABD3D] WandB initialized ✅")
+    except Exception as e:
+        use_wandb = False
+        print(f"[ABD3D] WandB not available: {e} ⚠️")
+
     start_step = 0
     if resume:
         print(f"[ABD3D] Searching checkpoints in: {config.checkpoint_dir}")
@@ -262,7 +284,6 @@ def train(config: Config, resume=None) -> None:
         if target_views.dim() == 5 and target_views.shape[1] == 1:
             target_views = target_views.squeeze(1)
 
-        # ✅ LPIPS OUTSIDE autocast — must use float32
         with torch.autocast(device_type=device.type,
                             enabled=scaler.is_enabled()):
             output     = model(input_view)
@@ -270,7 +291,7 @@ def train(config: Config, resume=None) -> None:
             mse        = nn.functional.mse_loss(pred_views, target_views)
             kl         = ImageVAE.kl_divergence(output["mu"], output["logvar"])
 
-        # ✅ LPIPS computed OUTSIDE autocast in float32
+        # ✅ LPIPS outside autocast
         perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
 
         loss = (
@@ -302,14 +323,39 @@ def train(config: Config, resume=None) -> None:
             for i in range(num_gpus)
         ) if num_gpus > 0 else 0.0
 
+        total_loss = loss.item() * config.gradient_accumulation_steps
+        mse_val    = mse.item()
+        lpips_val  = perceptual.item()
+        kl_val     = kl.item()
+        lr_val     = scheduler.get_last_lr()[0]
+
+        # ✅ Log to WandB every step
+        if use_wandb:
+            import wandb
+            wandb.log({
+                "loss":          total_loss,
+                "mse":           mse_val,
+                "lpips":         lpips_val,
+                "kl":            kl_val,
+                "learning_rate": lr_val,
+                "gpu_gb":        gpu_mem,
+                "step":          step,
+            })
+
         print(f"Step {step}/{config.max_steps - 1} | "
-              f"Loss: {loss.item() * config.gradient_accumulation_steps:.4f} | "
-              f"MSE: {mse.item():.4f} | "
-              f"LPIPS: {perceptual.item():.4f} | "
-              f"KL: {kl.item():.4f} | "
+              f"Loss: {total_loss:.4f} | "
+              f"MSE: {mse_val:.4f} | "
+              f"LPIPS: {lpips_val:.4f} | "
+              f"KL: {kl_val:.4f} | "
+              f"LR: {lr_val:.2e} | "
               f"GPU: {gpu_mem:.1f}GB")
         step += 1
 
     save_checkpoint(config.checkpoint_dir / "final.pt",
                     model, optimizer, scaler, scheduler, config.max_steps)
+
+    if use_wandb:
+        import wandb
+        wandb.finish()
+
     print("[ABD3D] Training complete! 🎉")
