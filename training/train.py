@@ -73,7 +73,7 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     return loss
 
 
-def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
+def save_checkpoint(path: Path, model, optimizer, scaler, scheduler, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_state = model.module.state_dict() \
         if isinstance(model, nn.DataParallel) \
@@ -82,15 +82,16 @@ def save_checkpoint(path: Path, model, optimizer, scaler, step: int) -> None:
         "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "step": step,
     }, path)
 
 
 def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
-                         scaler, step: int, keep_last: int = 3) -> None:
+                         scaler, scheduler, step: int, keep_last: int = 3) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"step_{step}.pt"
-    save_checkpoint(path, model, optimizer, scaler, step)
+    save_checkpoint(path, model, optimizer, scaler, scheduler, step)
     print(f"[ABD3D] Checkpoint saved: step_{step}.pt ✅")
 
     # Auto-backup to permanent storage (survives session end)
@@ -98,7 +99,9 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
     if permanent.parent.exists():
         permanent.mkdir(parents=True, exist_ok=True)
 
-        # Save checkpoint
+        for old_step in permanent.glob("step_*.pt"):
+            old_step.unlink(missing_ok=True)
+
         shutil.copy(path, permanent / f"step_{step}.pt")
 
         # Save shard progress
@@ -110,7 +113,6 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
                 shutil.copy(f, permanent / "shard_progress.json")
                 break
 
-        # Save shard list
         # Save shard list
         for f in [
             checkpoint_dir / "shard_list.json",
@@ -198,6 +200,8 @@ def train(config: Config, resume=None) -> None:
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=config.mixed_precision and device.type == "cuda")
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.max_steps, eta_min=1e-6)
 
     # LPIPS — kept on CPU to avoid GPU 0 overload with DataParallel
     lpips_metric = None
@@ -225,6 +229,8 @@ def train(config: Config, resume=None) -> None:
             base_model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
             scaler.load_state_dict(state.get("scaler", {}))
+            if state.get("scheduler") is not None:
+                scheduler.load_state_dict(state["scheduler"])
             start_step = state.get("step", 0)
             print(f"[ABD3D] Resumed from step {start_step} ✅")
         else:
@@ -284,13 +290,14 @@ def train(config: Config, resume=None) -> None:
                 base_model.parameters(), config.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
         # Checkpoint every 10 min
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(
-                config.checkpoint_dir, model, optimizer, scaler, step + 1)
+                config.checkpoint_dir, model, optimizer, scaler, scheduler, step + 1)
             last_checkpoint = time.monotonic()
 
         # Log
@@ -307,5 +314,5 @@ def train(config: Config, resume=None) -> None:
         step += 1
 
     save_checkpoint(config.checkpoint_dir / "final.pt",
-                    model, optimizer, scaler, config.max_steps)
+                    model, optimizer, scaler, scheduler, config.max_steps)
     print("[ABD3D] Training complete! 🎉")

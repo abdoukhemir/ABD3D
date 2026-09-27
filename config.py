@@ -22,7 +22,7 @@ class Config:
     gradient_accumulation_steps: int = 2
     num_workers: int = 0 if os.name == "nt" else 2
     max_steps: int = 100_000
-    learning_rate: float = 2e-4
+    learning_rate: float = 2e-5
     weight_decay: float = 0.01
     warmup_steps: int = 1_000
     grad_clip_norm: float = 1.0
