@@ -247,6 +247,11 @@ def train(config: Config, resume=None) -> None:
             if state.get("scheduler") is not None:
                 scheduler.load_state_dict(state["scheduler"])
             start_step = state.get("step", 0)
+
+            # ✅ Force new learning rate from config (ignores checkpoint LR)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = config.learning_rate
+            print(f"[ABD3D] LR forced to: {config.learning_rate} ✅")
             print(f"[ABD3D] Resumed from step {start_step} ✅")
         else:
             print("[ABD3D] No checkpoint — fresh start")
