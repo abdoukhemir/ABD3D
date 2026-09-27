@@ -75,25 +75,117 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     return loss.to(orig_device)
 
 
-def save_checkpoint(path: Path, model, optimizer, scaler, scheduler, step: int) -> None:
+class AdaptiveWeights:
+    """
+    SoftAdapt-inspired adaptive loss weights.
+    Automatically balances MSE, LPIPS and KL contributions.
+    """
+    def __init__(self, config: Config):
+        self.beta     = config.adaptive_beta
+        self.interval = config.adaptive_interval
+
+        self.mse_w   = config.mse_weight
+        self.lpips_w = config.lpips_weight
+        self.kl_w    = config.kl_weight
+
+        self.lpips_min = config.lpips_min_weight
+        self.lpips_max = config.lpips_max_weight
+        self.kl_min    = config.kl_min_weight
+        self.kl_max    = config.kl_max_weight
+
+        # Smoothed loss history
+        self.mse_ema   = None
+        self.lpips_ema = None
+        self.kl_ema    = None
+
+        self.prev_mse   = None
+        self.prev_lpips = None
+        self.prev_kl    = None
+
+    def update(self, mse: float, lpips: float, kl: float, step: int) -> bool:
+        """
+        Update EMAs. Returns True when weights are recalculated.
+        """
+        b = self.beta
+
+        # Update EMAs
+        self.mse_ema   = mse   if self.mse_ema   is None else b * self.mse_ema   + (1-b) * mse
+        self.lpips_ema = lpips if self.lpips_ema is None else b * self.lpips_ema + (1-b) * lpips
+        self.kl_ema    = kl    if self.kl_ema    is None else b * self.kl_ema    + (1-b) * kl
+
+        if step % self.interval != 0 or step == 0:
+            return False
+
+        if self.prev_mse is None:
+            self.prev_mse   = self.mse_ema
+            self.prev_lpips = self.lpips_ema
+            self.prev_kl    = self.kl_ema
+            return False
+
+        # Rate of change (negative = improving)
+        d_mse   = self.mse_ema   - self.prev_mse
+        d_lpips = self.lpips_ema - self.prev_lpips
+        d_kl    = self.kl_ema    - self.prev_kl
+
+        # ✅ If LPIPS not improving → reduce its weight
+        if d_lpips > 0:
+            self.lpips_w = max(self.lpips_w * 0.8, self.lpips_min)
+        elif d_lpips < -0.01:
+            self.lpips_w = min(self.lpips_w * 1.1, self.lpips_max)
+
+        # ✅ If KL too low → increase its weight
+        if self.kl_ema < 0.001:
+            self.kl_w = min(self.kl_w * 2.0, self.kl_max)
+        elif self.kl_ema > 0.1:
+            self.kl_w = max(self.kl_w * 0.5, self.kl_min)
+
+        # ✅ If MSE fighting LPIPS (MSE going up) → reduce LPIPS
+        if d_mse > 0 and d_lpips < 0:
+            self.lpips_w = max(self.lpips_w * 0.7, self.lpips_min)
+
+        self.prev_mse   = self.mse_ema
+        self.prev_lpips = self.lpips_ema
+        self.prev_kl    = self.kl_ema
+
+        return True
+
+    @property
+    def weights(self):
+        return self.mse_w, self.lpips_w, self.kl_w
+
+
+def save_checkpoint(path: Path, model, optimizer, scaler,
+                    scheduler, step: int,
+                    adaptive: 'AdaptiveWeights | None' = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     model_state = model.module.state_dict() \
         if isinstance(model, nn.DataParallel) \
         else model.state_dict()
     torch.save({
-        "model": model_state,
+        "model":     model_state,
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
+        "scaler":    scaler.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "step": step,
+        "step":      step,
+        # ✅ Save adaptive weights so they survive resume
+        "adaptive": {
+            "mse_w":    adaptive.mse_w,
+            "lpips_w":  adaptive.lpips_w,
+            "kl_w":     adaptive.kl_w,
+            "mse_ema":  adaptive.mse_ema,
+            "lpips_ema":adaptive.lpips_ema,
+            "kl_ema":   adaptive.kl_ema,
+        } if adaptive is not None else None,
     }, path)
 
 
 def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
-                         scaler, scheduler, step: int, keep_last: int = 3) -> None:
+                         scaler, scheduler, step: int,
+                         adaptive: 'AdaptiveWeights | None' = None,
+                         keep_last: int = 3) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"step_{step}.pt"
-    save_checkpoint(path, model, optimizer, scaler, scheduler, step)
+    save_checkpoint(path, model, optimizer, scaler, scheduler, step, adaptive)
     print(f"[ABD3D] Checkpoint saved: step_{step}.pt ✅")
 
     permanent = Path("/kaggle/working/abd3d-checkpoints")
@@ -194,8 +286,17 @@ def train(config: Config, resume=None) -> None:
         "cuda",
         enabled=config.mixed_precision and device.type == "cuda")
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.max_steps, eta_min=1e-6)
+    # ✅ ReduceLROnPlateau — auto-reduces LR when loss plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=config.lr_factor,
+        patience=config.lr_patience,
+        min_lr=config.lr_min,
+    )
+
+    # ✅ Adaptive loss weights
+    adaptive = AdaptiveWeights(config) if config.adaptive_weights else None
 
     lpips_metric = None
     try:
@@ -208,6 +309,7 @@ def train(config: Config, resume=None) -> None:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
     # ✅ WandB Init
+    use_wandb = False
     try:
         import wandb
         wandb.init(
@@ -221,13 +323,13 @@ def train(config: Config, resume=None) -> None:
                 "lpips_weight":  config.lpips_weight,
                 "kl_weight":     config.kl_weight,
                 "image_size":    config.image_size,
+                "adaptive":      config.adaptive_weights,
             },
             resume="allow",
         )
         use_wandb = True
         print("[ABD3D] WandB initialized ✅")
     except Exception as e:
-        use_wandb = False
         print(f"[ABD3D] WandB not available: {e} ⚠️")
 
     start_step = 0
@@ -245,10 +347,27 @@ def train(config: Config, resume=None) -> None:
             optimizer.load_state_dict(state["optimizer"])
             scaler.load_state_dict(state.get("scaler", {}))
             if state.get("scheduler") is not None:
-                scheduler.load_state_dict(state["scheduler"])
+                try:
+                    scheduler.load_state_dict(state["scheduler"])
+                except Exception:
+                    pass  # scheduler type changed — start fresh
             start_step = state.get("step", 0)
 
-            # ✅ Force new learning rate from config (ignores checkpoint LR)
+            # ✅ Restore adaptive weights if available
+            if adaptive is not None and state.get("adaptive"):
+                a = state["adaptive"]
+                adaptive.mse_w    = a.get("mse_w",    config.mse_weight)
+                adaptive.lpips_w  = a.get("lpips_w",  config.lpips_weight)
+                adaptive.kl_w     = a.get("kl_w",     config.kl_weight)
+                adaptive.mse_ema  = a.get("mse_ema")
+                adaptive.lpips_ema= a.get("lpips_ema")
+                adaptive.kl_ema   = a.get("kl_ema")
+                print(f"[ABD3D] Adaptive weights restored: "
+                      f"MSE={adaptive.mse_w:.3f} "
+                      f"LPIPS={adaptive.lpips_w:.3f} "
+                      f"KL={adaptive.kl_w:.2e} ✅")
+
+            # ✅ Force new LR from config
             for param_group in optimizer.param_groups:
                 param_group['lr'] = config.learning_rate
             print(f"[ABD3D] LR forced to: {config.learning_rate} ✅")
@@ -261,10 +380,13 @@ def train(config: Config, resume=None) -> None:
     last_checkpoint = time.monotonic()
 
     dataloader = get_fresh_dataloader(config)
-    iterator = iter(dataloader)
-    step = start_step
+    iterator   = iter(dataloader)
+    step       = start_step
 
     print(f"[ABD3D] Training: step {step} → {config.max_steps} 🚀")
+    if adaptive:
+        print(f"[ABD3D] Adaptive weights ON "
+              f"(interval={config.adaptive_interval} steps) ✅")
 
     while step < config.max_steps:
 
@@ -273,12 +395,12 @@ def train(config: Config, resume=None) -> None:
         except StopIteration:
             print(f"[ABD3D] Shard done → next shard (step {step})")
             dataloader = get_fresh_dataloader(config)
-            iterator = iter(dataloader)
+            iterator   = iter(dataloader)
             continue
         except Exception as e:
             print(f"[ABD3D] Error: {e} → reloading...")
             dataloader = get_fresh_dataloader(config)
-            iterator = iter(dataloader)
+            iterator   = iter(dataloader)
             continue
 
         input_view   = batch["input_view"].to(device, non_blocking=True)
@@ -299,10 +421,24 @@ def train(config: Config, resume=None) -> None:
         # ✅ LPIPS outside autocast
         perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
 
+        # ✅ Get current weights (adaptive or fixed)
+        if adaptive is not None:
+            changed = adaptive.update(mse.item(), perceptual.item(), kl.item(), step)
+            mse_w, lpips_w, kl_w = adaptive.weights
+            if changed:
+                print(f"[ABD3D] Weights updated → "
+                      f"MSE={mse_w:.3f} "
+                      f"LPIPS={lpips_w:.3f} "
+                      f"KL={kl_w:.2e}")
+        else:
+            mse_w   = config.mse_weight
+            lpips_w = config.lpips_weight
+            kl_w    = config.kl_weight
+
         loss = (
-            config.mse_weight  * mse +
-            config.lpips_weight * perceptual +
-            config.kl_weight   * kl
+            mse_w   * mse +
+            lpips_w * perceptual +
+            kl_w    * kl
         ) / config.gradient_accumulation_steps
 
         scaler.scale(loss).backward()
@@ -313,17 +449,19 @@ def train(config: Config, resume=None) -> None:
                 base_model.parameters(), config.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+
+            # ✅ ReduceLROnPlateau needs the loss value
+            scheduler.step(loss.item())
 
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(
                 config.checkpoint_dir, model, optimizer,
-                scaler, scheduler, step + 1)
+                scaler, scheduler, step + 1, adaptive)
             last_checkpoint = time.monotonic()
 
-        gpu_mem = sum(
+        gpu_mem    = sum(
             torch.cuda.memory_reserved(i) / 1e9
             for i in range(num_gpus)
         ) if num_gpus > 0 else 0.0
@@ -332,9 +470,8 @@ def train(config: Config, resume=None) -> None:
         mse_val    = mse.item()
         lpips_val  = perceptual.item()
         kl_val     = kl.item()
-        lr_val     = scheduler.get_last_lr()[0]
+        lr_val     = optimizer.param_groups[0]['lr']
 
-        # ✅ Log to WandB every step
         if use_wandb:
             import wandb
             wandb.log({
@@ -344,6 +481,9 @@ def train(config: Config, resume=None) -> None:
                 "kl":            kl_val,
                 "learning_rate": lr_val,
                 "gpu_gb":        gpu_mem,
+                "mse_weight":    mse_w,
+                "lpips_weight":  lpips_w,
+                "kl_weight":     kl_w,
                 "step":          step,
             })
 
@@ -353,11 +493,13 @@ def train(config: Config, resume=None) -> None:
               f"LPIPS: {lpips_val:.4f} | "
               f"KL: {kl_val:.4f} | "
               f"LR: {lr_val:.2e} | "
+              f"W: {mse_w:.2f}/{lpips_w:.3f}/{kl_w:.0e} | "
               f"GPU: {gpu_mem:.1f}GB")
         step += 1
 
     save_checkpoint(config.checkpoint_dir / "final.pt",
-                    model, optimizer, scaler, scheduler, config.max_steps)
+                    model, optimizer, scaler, scheduler,
+                    config.max_steps, adaptive)
 
     if use_wandb:
         import wandb
