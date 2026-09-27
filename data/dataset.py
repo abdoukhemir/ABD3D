@@ -31,7 +31,6 @@ def resolve_project_path(path) -> Path:
 
 
 def _load_or_fetch_shards(repo_id: str) -> list:
-    """Fetch shard list ONCE — save locally — never call HF API again."""
     if SHARD_LIST_FILE.exists():
         try:
             data = json.loads(SHARD_LIST_FILE.read_text(encoding="utf-8"))
@@ -72,10 +71,8 @@ def _save_progress(index: int, total: int, name: str) -> None:
     }, indent=2), encoding="utf-8")
 
 
-def _download_shard_wget(repo_id: str, shard_name: str) -> Path:
-    """
-    Download shard using the Hugging Face hub API.
-    """
+def _download_shard(repo_id: str, shard_name: str) -> Path:
+    """Download shard using hf_hub_download with correct local_dir."""
     local_path = CACHE_DIR / Path(shard_name).name
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -84,31 +81,19 @@ def _download_shard_wget(repo_id: str, shard_name: str) -> Path:
         return local_path
 
     print(f"[ABD3D] Downloading: {shard_name}")
-    downloaded = Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            filename=shard_name,
-        )
-    )
-
-    if downloaded != local_path:
-        local_path.write_bytes(downloaded.read_bytes())
-        downloaded.unlink(missing_ok=True)
-
-    print(f"[ABD3D] Downloaded to: {local_path}")
-    return local_path
+    # ✅ local_dir ensures file goes exactly where we want
+    downloaded = Path(hf_hub_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        filename=shard_name,
+        local_dir=str(CACHE_DIR),
+        local_dir_use_symlinks=False,
+    ))
+    print(f"[ABD3D] Downloaded to: {downloaded}")
+    return downloaded
 
 
 class CompleteObjaverseDataset(IterableDataset):
-    """
-    Rolling cache dataset for zeyuanyin/complete-objaverse.
-    Each parquet = 1 object = 48 views.
-    Downloads ONE shard → trains → deletes → next shard.
-    Max disk: ~30MB at any time.
-    Uses wget for reliable downloads in all Kaggle modes.
-    """
-
     def __init__(
         self,
         name: str = "zeyuanyin/complete-objaverse",
@@ -152,7 +137,6 @@ class CompleteObjaverseDataset(IterableDataset):
         if not self.shards:
             raise ValueError(f"No shards found for '{self.name}'")
 
-        # Load progress
         progress = _load_progress()
         shard_index = int(progress.get("current_shard_index", 0))
         total_processed = int(progress.get("total_shards_processed", 0))
@@ -163,8 +147,7 @@ class CompleteObjaverseDataset(IterableDataset):
         shard_name = self.shards[shard_index]
         print(f"[ABD3D] Loading shard {shard_index}/{len(self.shards)}: {shard_name}")
 
-        # ✅ Use wget — no more hanging in commit mode!
-        local_path = _download_shard_wget(self.name, shard_name)
+        local_path = _download_shard(self.name, shard_name)
 
         try:
             df = pd.read_parquet(local_path)
@@ -226,6 +209,5 @@ class CompleteObjaverseDataset(IterableDataset):
             print(f"[ABD3D] Advanced to shard {next_index}/{len(self.shards)}")
 
 
-# Aliases
 ObjaverseStreamingDataset = CompleteObjaverseDataset
 ShapeNetStreamingDataset  = CompleteObjaverseDataset

@@ -64,14 +64,15 @@ class ABD3DModel(nn.Module):
 def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     if metric is None:
         return torch.zeros((), device=prediction.device)
-    # ✅ Cast to float32 for LPIPS
+    orig_device = prediction.device
+    # ✅ float32 for LPIPS — must be outside autocast
     prediction = prediction.detach().float().reshape(-1, *prediction.shape[-3:])
     target = target.detach().float().reshape(-1, *target.shape[-3:])
     loss = metric(
         prediction.mul(2).sub(1),
         target.mul(2).sub(1)
     ).mean()
-    return loss
+    return loss.to(orig_device)  # ✅ return to original device
 
 
 def save_checkpoint(path: Path, model, optimizer, scaler, scheduler, step: int) -> None:
@@ -95,43 +96,38 @@ def save_step_checkpoint(checkpoint_dir: Path, model, optimizer,
     save_checkpoint(path, model, optimizer, scaler, scheduler, step)
     print(f"[ABD3D] Checkpoint saved: step_{step}.pt ✅")
 
-    # Auto-backup to permanent storage (survives session end)
     permanent = Path("/kaggle/working/abd3d-checkpoints")
-    if permanent.parent.exists():
-        permanent.mkdir(parents=True, exist_ok=True)
+    permanent.mkdir(parents=True, exist_ok=True)
 
-        for old_step in permanent.glob("step_*.pt"):
-            old_step.unlink(missing_ok=True)
+    # ✅ Delete old checkpoints from permanent first
+    for old in permanent.glob("step_*.pt"):
+        old.unlink(missing_ok=True)
 
-        shutil.copy(path, permanent / f"step_{step}.pt")
+    shutil.copy(path, permanent / f"step_{step}.pt")
 
-        # Save shard progress
-        for f in [
-            checkpoint_dir / "shard_progress.json",
-            BASE_DIR / "checkpoints" / "shard_progress.json",
-        ]:
-            if f.exists():
-                shutil.copy(f, permanent / "shard_progress.json")
-                break
+    for f in [
+        checkpoint_dir / "shard_progress.json",
+        BASE_DIR / "checkpoints" / "shard_progress.json",
+    ]:
+        if f.exists():
+            shutil.copy(f, permanent / "shard_progress.json")
+            break
 
-        # Save shard list
-        for f in [
-            checkpoint_dir / "shard_list.json",
-            BASE_DIR / "checkpoints" / "shard_list.json",
-        ]:
-            if f.exists():
-                shutil.copy(f, permanent / "shard_list.json")
-                break
+    for f in [
+        checkpoint_dir / "shard_list.json",
+        BASE_DIR / "checkpoints" / "shard_list.json",
+    ]:
+        if f.exists():
+            shutil.copy(f, permanent / "shard_list.json")
+            break
 
-        # ✅ Backup VGG16 — never download again
-        vgg = Path('/kaggle/working/torch_cache/hub/checkpoints/vgg16-397923af.pth')
-        if vgg.exists() and not (permanent / 'vgg16-397923af.pth').exists():
-            shutil.copy(vgg, permanent / 'vgg16-397923af.pth')
-            print("[ABD3D] VGG16 backed up ✅")
+    vgg = Path('/kaggle/working/torch_cache/hub/checkpoints/vgg16-397923af.pth')
+    if vgg.exists() and not (permanent / 'vgg16-397923af.pth').exists():
+        shutil.copy(vgg, permanent / 'vgg16-397923af.pth')
+        print("[ABD3D] VGG16 backed up ✅")
 
-        print(f"[ABD3D] Backed up to permanent storage ✅")
+    print(f"[ABD3D] Backed up to permanent storage ✅")
 
-    # Keep only last N checkpoints locally
     files = sorted(checkpoint_dir.glob("step_*.pt"),
                    key=lambda p: p.stat().st_mtime)
     while len(files) > keep_last:
@@ -166,7 +162,6 @@ def train(config: Config, resume=None) -> None:
     print(f"[ABD3D] checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
 
-    # GPU Setup
     if torch.cuda.is_available():
         device = torch.device("cuda")
         num_gpus = torch.cuda.device_count()
@@ -180,12 +175,10 @@ def train(config: Config, resume=None) -> None:
         num_gpus = 0
         print("[ABD3D] WARNING: No GPU — using CPU ⚠️")
 
-    # Build model
     base_model = ABD3DModel(config).to(device)
     total_params = sum(p.numel() for p in base_model.parameters()) / 1e6
     print(f"[ABD3D] Model: {total_params:.1f}M parameters")
 
-    # Wrap with DataParallel if multiple GPUs
     if num_gpus > 1:
         model = nn.DataParallel(base_model)
         print(f"[ABD3D] DataParallel across {num_gpus} GPUs 🔥")
@@ -201,10 +194,10 @@ def train(config: Config, resume=None) -> None:
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=config.mixed_precision and device.type == "cuda")
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.max_steps, eta_min=1e-6)
 
-    # LPIPS — kept on CPU to avoid GPU 0 overload with DataParallel
     lpips_metric = None
     try:
         import lpips
@@ -215,7 +208,6 @@ def train(config: Config, resume=None) -> None:
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
-    # Resume
     start_step = 0
     if resume:
         print(f"[ABD3D] Searching checkpoints in: {config.checkpoint_dir}")
@@ -270,18 +262,22 @@ def train(config: Config, resume=None) -> None:
         if target_views.dim() == 5 and target_views.shape[1] == 1:
             target_views = target_views.squeeze(1)
 
+        # ✅ LPIPS OUTSIDE autocast — must use float32
         with torch.autocast(device_type=device.type,
                             enabled=scaler.is_enabled()):
             output     = model(input_view)
             pred_views = output["predicted_views"]
             mse        = nn.functional.mse_loss(pred_views, target_views)
-            perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
             kl         = ImageVAE.kl_divergence(output["mu"], output["logvar"])
-            loss       = (
-                config.mse_weight  * mse +
-                config.lpips_weight * perceptual +
-                config.kl_weight   * kl
-            ) / config.gradient_accumulation_steps
+
+        # ✅ LPIPS computed OUTSIDE autocast in float32
+        perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
+
+        loss = (
+            config.mse_weight  * mse +
+            config.lpips_weight * perceptual +
+            config.kl_weight   * kl
+        ) / config.gradient_accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -294,14 +290,13 @@ def train(config: Config, resume=None) -> None:
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # Checkpoint every 10 min
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
             save_step_checkpoint(
-                config.checkpoint_dir, model, optimizer, scaler, scheduler, step + 1)
+                config.checkpoint_dir, model, optimizer,
+                scaler, scheduler, step + 1)
             last_checkpoint = time.monotonic()
 
-        # Log
         gpu_mem = sum(
             torch.cuda.memory_reserved(i) / 1e9
             for i in range(num_gpus)
@@ -310,6 +305,7 @@ def train(config: Config, resume=None) -> None:
         print(f"Step {step}/{config.max_steps - 1} | "
               f"Loss: {loss.item() * config.gradient_accumulation_steps:.4f} | "
               f"MSE: {mse.item():.4f} | "
+              f"LPIPS: {perceptual.item():.4f} | "
               f"KL: {kl.item():.4f} | "
               f"GPU: {gpu_mem:.1f}GB")
         step += 1
