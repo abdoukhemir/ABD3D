@@ -134,10 +134,18 @@ class AdaptiveWeights:
             self.lpips_w = min(self.lpips_w * 1.1, self.lpips_max)
 
         # ✅ If KL too low → increase its weight
-        if self.kl_ema < 0.001:
-            self.kl_w = min(self.kl_w * 2.0, self.kl_max)
-        elif self.kl_ema > 0.1:
-            self.kl_w = max(self.kl_w * 0.5, self.kl_min)
+        
+
+        if self.kl_ema is not None and self.kl_ema < 0.0001:
+   
+             self.kl_w = min(self.kl_w * 10.0, self.kl_max)
+             print(f"[ABD3D] ⚠️ Posterior collapse! KL≈0 → KL weight × 10 = {self.kl_w:.2e}")
+        elif self.kl_ema is not None and self.kl_ema < 0.001:
+    
+             self.kl_w = min(self.kl_w * 3.0, self.kl_max)
+        elif self.kl_ema is not None and self.kl_ema > 0.1:
+    
+             self.kl_w = max(self.kl_w * 0.5, self.kl_min)
 
         # ✅ If MSE fighting LPIPS (MSE going up) → reduce LPIPS
         if d_mse > 0 and d_lpips < 0:

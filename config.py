@@ -39,7 +39,7 @@ class Config:
     lpips_min_weight: float = 0.01     # LPIPS never goes below this
     lpips_max_weight: float = 0.3      # LPIPS never goes above this
     kl_min_weight: float = 1e-5        # KL never goes below this
-    kl_max_weight: float = 1e-2        # KL never goes above this
+    kl_max_weight: float = 1e-1        # KL never goes above this
 
     # ✅ ReduceLROnPlateau settings
     lr_patience: int = 1000             # steps before reducing LR
