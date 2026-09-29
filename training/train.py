@@ -243,7 +243,7 @@ def get_fresh_dataloader(config: Config) -> DataLoader:
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=0)
 
 
-def train(config: Config, resume=None) -> None:
+def train(config: Config, resume=None, require_multi_gpu: bool = False) -> None:
     config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
     print(f"[ABD3D] checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
@@ -261,12 +261,21 @@ def train(config: Config, resume=None) -> None:
         num_gpus = 0
         print("[ABD3D] WARNING: No GPU — using CPU ⚠️")
 
+    if require_multi_gpu and num_gpus < 2:
+        raise RuntimeError(
+            f"Multi-GPU training requested, but only {num_gpus} CUDA GPU(s) "
+            "are visible. Set CUDA_VISIBLE_DEVICES to include both GPUs.")
+
     base_model = ABD3DModel(config).to(device)
     total_params = sum(p.numel() for p in base_model.parameters()) / 1e6
     print(f"[ABD3D] Model: {total_params:.1f}M parameters")
 
     if num_gpus > 1:
-        model = nn.DataParallel(base_model)
+        model = nn.DataParallel(
+            base_model,
+            device_ids=list(range(num_gpus)),
+            output_device=0,
+        )
         print(f"[ABD3D] DataParallel across {num_gpus} GPUs 🔥")
     else:
         model = base_model
@@ -429,7 +438,11 @@ def train(config: Config, resume=None) -> None:
 
         with torch.autocast(device_type=device.type,
                             enabled=scaler.is_enabled()):
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Forward pass...",
+                flush=True)
             output     = model(input_view)
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Forward done ✅",
+                flush=True)
             pred_views = output["predicted_views"]
             mse        = nn.functional.mse_loss(pred_views, target_views)
             kl         = ImageVAE.kl_divergence(output["mu"], output["logvar"])
@@ -493,7 +506,7 @@ def train(config: Config, resume=None) -> None:
 
         if use_wandb:
             import wandb
-            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Logging to WandB...",
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} WandB logging...",
                   flush=True)
             wandb.log({
                 "loss":              total_loss,

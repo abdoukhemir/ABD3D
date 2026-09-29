@@ -14,6 +14,8 @@ def main() -> None:
                         help="Resume from latest checkpoint.")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--require-multi-gpu", action="store_true",
+                        help="Fail unless at least two CUDA GPUs are visible.")
     parser.add_argument("--synthetic", action="store_true",
                         help="Use synthetic data instead of real dataset.")
     args = parser.parse_args()
@@ -67,7 +69,8 @@ def main() -> None:
         return
 
     # ✅ Pass resume flag directly — train() finds checkpoint automatically
-    train(config, resume=args.resume)
+        train(config, resume=args.resume,
+                    require_multi_gpu=args.require_multi_gpu)
 
 
 if __name__ == "__main__":

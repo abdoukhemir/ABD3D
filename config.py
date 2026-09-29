@@ -65,8 +65,6 @@ class Config:
     def apply_memory_budget(self) -> None:
         if os.name == "nt":
             self.num_workers = 0
-        if self.device_type == "cuda":
-            self.batch_size = min(self.batch_size, 8)
 
 
 DEFAULT_CONFIG = Config()
