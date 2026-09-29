@@ -3,25 +3,40 @@ from torch import nn
 
 
 class DiTGenerator(nn.Module):
-    """Diffusion-style Transformer that maps image tokens to triplane tokens."""
+    """Transformer decoder: learnable triplane queries cross-attend to ALL image
+    tokens (no pooling) and are conditioned on the input-view pose.
+    (Feed-forward, not diffusion; the name is kept so imports keep working.)"""
 
-    def __init__(self, conditioning_dim: int = 384, latent_dim: int = 256,
-                 plane_channels: int = 32, plane_size: int = 32, depth: int = 8, heads: int = 8):
+    def __init__(self, conditioning_dim: int = 448, plane_channels: int = 32,
+                 plane_size: int = 32, token_grid: int = 16,
+                 depth: int = 6, heads: int = 8):
         super().__init__()
+        if plane_size % token_grid:
+            raise ValueError("plane_size must be a multiple of token_grid")
         self.plane_channels = plane_channels
-        self.plane_size = plane_size
-        self.token_dim = plane_channels * 3
-        self.input = nn.Linear(conditioning_dim + latent_dim, conditioning_dim)
-        layer = nn.TransformerEncoderLayer(conditioning_dim, heads, conditioning_dim * 4,
-                                           batch_first=True, norm_first=True, activation="gelu")
-        self.blocks = nn.TransformerEncoder(layer, depth)
-        self.norm = nn.LayerNorm(conditioning_dim)
-        self.output = nn.Linear(conditioning_dim, self.token_dim * plane_size * plane_size)
+        self.token_grid = token_grid
+        self.upscale = plane_size // token_grid
 
-    def forward(self, image_tokens: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-        pooled_latent = latent.mean(dim=(-2, -1))
-        pooled_tokens = image_tokens.mean(dim=1)
-        hidden = self.input(torch.cat((pooled_tokens, pooled_latent), dim=-1)).unsqueeze(1)
-        hidden = self.norm(self.blocks(hidden)).squeeze(1)
-        planes = self.output(hidden).view(-1, 3, self.plane_channels, self.plane_size, self.plane_size)
-        return planes
+        self.plane_tokens = nn.Parameter(
+            torch.zeros(1, 3 * token_grid * token_grid, conditioning_dim))
+        nn.init.trunc_normal_(self.plane_tokens, std=0.02)
+
+        layer = nn.TransformerDecoderLayer(
+            conditioning_dim, heads, conditioning_dim * 4,
+            batch_first=True, norm_first=True, activation="gelu")
+        self.blocks = nn.TransformerDecoder(
+            layer, depth, norm=nn.LayerNorm(conditioning_dim))
+        self.output = nn.Linear(
+            conditioning_dim, plane_channels * self.upscale * self.upscale)
+
+    def forward(self, image_tokens: torch.Tensor,
+                pose_embedding: torch.Tensor) -> torch.Tensor:
+        batch = image_tokens.shape[0]
+        g, u, c = self.token_grid, self.upscale, self.plane_channels
+        memory = image_tokens + pose_embedding[:, None]
+        queries = self.plane_tokens.expand(batch, -1, -1) + pose_embedding[:, None]
+        hidden = self.blocks(queries, memory)
+        out = self.output(hidden)                                # [B, 3*g*g, C*u*u]
+        out = out.view(batch, 3, g, g, c, u, u)
+        out = out.permute(0, 1, 4, 2, 5, 3, 6).reshape(batch, 3, c, g * u, g * u)
+        return out

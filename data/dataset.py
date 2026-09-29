@@ -1,26 +1,27 @@
 import io
 import json
 import os
+import queue
 import random
+import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pyarrow.parquet as pq
 import requests
 import torch
 from huggingface_hub import HfApi
 from PIL import Image
 from torch.utils.data import IterableDataset
-from torchvision import transforms
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = BASE_DIR / "checkpoints" / "rolling_cache"
-PROGRESS_FILE   = BASE_DIR / "checkpoints" / "shard_progress.json"
+PROGRESS_FILE = BASE_DIR / "checkpoints" / "shard_progress.json"
 SHARD_LIST_FILE = BASE_DIR / "checkpoints" / "shard_list.json"
+BACKGROUND = 255.0  # views are composited onto white
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-print(f"[ABD3D] BASE_DIR={BASE_DIR}")
 
 
 def resolve_project_path(path) -> Path:
@@ -32,6 +33,9 @@ def resolve_project_path(path) -> Path:
     return candidate.resolve()
 
 
+# --------------------------------------------------------------------------- #
+# shard list / progress
+# --------------------------------------------------------------------------- #
 def _load_or_fetch_shards(repo_id: str) -> list:
     if SHARD_LIST_FILE.exists():
         try:
@@ -43,16 +47,20 @@ def _load_or_fetch_shards(repo_id: str) -> list:
             pass
 
     print("[ABD3D] Fetching shard list from HuggingFace (first time only)...")
-    api = HfApi()
-    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset")
     shards = sorted(
-        f for f in files
-        if f.endswith(".parquet") and "dome_objaverse" in f
-    )
+        f for f in files if f.endswith(".parquet") and "dome_objaverse" in f)
     SHARD_LIST_FILE.parent.mkdir(parents=True, exist_ok=True)
     SHARD_LIST_FILE.write_text(json.dumps(shards, indent=2), encoding="utf-8")
     print(f"[ABD3D] Found {len(shards)} shards — saved locally ✅")
     return shards
+
+
+def split_shards(shards: list, seed: int, val_objects: int):
+    """Deterministic shuffle; the first `val_objects` shards are held out."""
+    order = sorted(shards)
+    random.Random(seed).shuffle(order)
+    return order[val_objects:], order[:val_objects]
 
 
 def _load_progress() -> dict:
@@ -73,222 +81,227 @@ def _save_progress(index: int, total: int, name: str) -> None:
     }, indent=2), encoding="utf-8")
 
 
-def _download_shard(repo_id: str, shard_name: str) -> Path:
-    local_path = CACHE_DIR / Path(shard_name).name
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-
+# --------------------------------------------------------------------------- #
+# download + decode
+# --------------------------------------------------------------------------- #
+def _download_shard(repo_id: str, shard_name: str, max_retries: int = 5) -> Path:
+    """Returns the local path or raises RuntimeError. Never touches progress."""
+    local_path = CACHE_DIR / shard_name.replace("/", "__")
     if local_path.exists():
-        print(f"[ABD3D] Shard already cached ✅")
         return local_path
+    part_path = local_path.with_suffix(local_path.suffix + ".part")
 
-    token = os.environ.get('HF_TOKEN', '')
-    url = (f"https://huggingface.co/datasets/{repo_id}"
-           f"/resolve/main/{shard_name}")
-    headers = {"Authorization": f"Bearer {token}"}
+    token = os.environ.get("HF_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{shard_name}"
 
-    max_retries   = 5
-    stall_timeout = 30
-
+    last_error = None
     for attempt in range(max_retries):
         try:
-            print(f"[ABD3D] Downloading: {shard_name} "
-                  f"(attempt {attempt + 1}/{max_retries})")
-
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=(10, 30),
-                stream=True,
-            )
-            response.raise_for_status()
-
-            last_byte_time = time.monotonic()
-            last_report_time = last_byte_time
-            bytes_written  = 0
-            total_bytes = response.headers.get("Content-Length")
-
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-                        bytes_written  += len(chunk)
-                        last_byte_time  = time.monotonic()
-
-                    now = time.monotonic()
-                    elapsed = now - last_byte_time
-                    if elapsed > stall_timeout:
-                        raise TimeoutError(
-                            f"Stalled {elapsed:.0f}s with no bytes")
-                    if now - last_report_time >= 10:
-                        total = f"/{int(total_bytes) / 1e6:.1f}MB" \
-                            if total_bytes else ""
-                        print(f"[ABD3D] Download progress: "
-                              f"{bytes_written / 1e6:.1f}MB{total}")
-                        last_report_time = now
-
-            print(f"[ABD3D] Downloaded {bytes_written / 1e6:.1f}MB ✅")
+            with requests.get(url, headers=headers, timeout=(10, 30),
+                              stream=True) as response:
+                response.raise_for_status()
+                with open(part_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+            os.replace(part_path, local_path)   # only complete files are "cached"
             return local_path
-
-        except Exception as e:
-            print(f"[ABD3D] Download error: {e}")
-            if local_path.exists():
-                local_path.unlink()
+        except Exception as exc:
+            last_error = exc
+            part_path.unlink(missing_ok=True)
+            print(f"[ABD3D] Download error ({shard_name}, "
+                  f"attempt {attempt + 1}/{max_retries}): {exc}")
             if attempt < max_retries - 1:
-                wait = 10 * (attempt + 1)
-                print(f"[ABD3D] Retrying in {wait}s...")
-                time.sleep(wait)
+                time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"Failed to download {shard_name}: {last_error}")
 
-    # ✅ All retries failed → skip this shard and advance to next
-    print(f"[ABD3D] ⚠️ All {max_retries} attempts failed for {shard_name}")
-    print(f"[ABD3D] Skipping shard and advancing to next...")
-    
-    # Advance progress to next shard
-    progress = _load_progress()
-    current_index = int(progress.get("current_shard_index", 0))
-    total = int(progress.get("total_shards_processed", 0))
-    
-    # Load shard list to find next index
-    shards = json.loads(SHARD_LIST_FILE.read_text(encoding="utf-8"))
-    next_index = (current_index + 1) % len(shards)
-    _save_progress(next_index, total + 1, shard_name)
-    print(f"[ABD3D] Advanced to shard {next_index}/{len(shards)}")
-    
-    raise RuntimeError(f"Skipped shard {shard_name} after {max_retries} failures")
+
+def _decode_view(payload, image_size: int):
+    """RGBA png -> (rgb uint8 [3,S,S] composited on white, alpha uint8 [1,S,S])."""
+    if payload is None:
+        return None
+    try:
+        arr = np.asarray(Image.open(io.BytesIO(payload)).convert("RGBA"),
+                         dtype=np.float32)
+        alpha = arr[..., 3:4] / 255.0
+        rgb = arr[..., :3] * alpha + BACKGROUND * (1.0 - alpha)
+        size = (image_size, image_size)
+        rgb_img = Image.fromarray(
+            np.clip(rgb.round(), 0, 255).astype(np.uint8)).resize(size, Image.BILINEAR)
+        alpha_img = Image.fromarray(
+            np.clip(arr[..., 3].round(), 0, 255).astype(np.uint8)).resize(size, Image.BILINEAR)
+        rgb_t = torch.from_numpy(np.array(rgb_img)).permute(2, 0, 1).contiguous()
+        alpha_t = torch.from_numpy(np.array(alpha_img)).unsqueeze(0).contiguous()
+        return rgb_t, alpha_t
+    except Exception:
+        return None
+
+
+def load_object(repo_id: str, shard_name: str, image_size: int):
+    """One shard = one object (48 views). Returns a dict of uint8 tensors or None."""
+    path = _download_shard(repo_id, shard_name)
+    try:
+        table = pq.read_table(path, columns=["view_id", "image_png"])
+        view_ids = table.column("view_id").to_pylist()
+        payloads = table.column("image_png").to_pylist()
+    finally:
+        path.unlink(missing_ok=True)
+
+    images, alphas, ids = [], [], []
+    for view_id, payload in sorted(zip(view_ids, payloads), key=lambda x: x[0]):
+        decoded = _decode_view(payload, image_size)
+        if decoded is None:
+            continue  # view_id stays correct even when a view is dropped
+        images.append(decoded[0])
+        alphas.append(decoded[1])
+        ids.append(view_id)
+    if len(ids) < 2:
+        return None
+    return {
+        "images": torch.stack(images),                         # [V,3,S,S] uint8
+        "alphas": torch.stack(alphas),                         # [V,1,S,S] uint8
+        "view_ids": torch.tensor(ids, dtype=torch.long),       # [V]
+    }
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def make_sample(obj: dict, num_targets: int, same_view_prob: float, rng) -> dict:
+    n = obj["view_ids"].shape[0]
+    inp = rng.randrange(n)
+    others = [i for i in range(n) if i != inp]
+    if len(others) >= num_targets:
+        targets = rng.sample(others, num_targets)
+    else:
+        targets = [rng.choice(others) for _ in range(num_targets)]
+    targets = [inp if rng.random() < same_view_prob else t for t in targets]
+    idx = torch.tensor(targets, dtype=torch.long)
+    return {
+        "input_image": obj["images"][inp],            # [3,S,S] uint8
+        "target_images": obj["images"][idx],          # [T,3,S,S] uint8
+        "target_alpha": obj["alphas"][idx],           # [T,1,S,S] uint8
+        "input_view_id": obj["view_ids"][inp],        # scalar long
+        "target_view_ids": obj["view_ids"][idx],      # [T] long
+    }
+
+
+def build_fixed_batch(objects: list, num_targets: int, pairs_per_object: int,
+                      seed: int = 0) -> dict:
+    """Deterministic validation batch."""
+    rng = random.Random(seed)
+    samples = [make_sample(o, num_targets, 0.0, rng)
+               for o in objects for _ in range(pairs_per_object)]
+    return {k: torch.stack([s[k] for s in samples]) for k in samples[0]}
+
+
+class _ObjectFeeder:
+    """Background thread that downloads + decodes shards so the GPU never waits."""
+
+    def __init__(self, repo_id, shards, image_size, start_index,
+                 total_processed, prefetch):
+        self.repo_id = repo_id
+        self.shards = shards
+        self.image_size = image_size
+        self.start_index = start_index
+        self.total_processed = total_processed
+        self.queue = queue.Queue(maxsize=max(1, prefetch))
+        self.stop_event = threading.Event()
+        self.fatal = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        n = len(self.shards)
+        index, total, failures = self.start_index, self.total_processed, 0
+        while not self.stop_event.is_set():
+            name = self.shards[index % n]
+            obj = None
+            try:
+                obj = load_object(self.repo_id, name, self.image_size)
+            except Exception as exc:
+                print(f"[ABD3D] Skipping shard {name}: {exc}")
+            index += 1
+            total += 1
+            _save_progress(index % n, total, name)
+            if obj is None:
+                failures += 1
+                if failures >= 10:
+                    self.fatal = RuntimeError(
+                        "10 shards in a row failed to load; check network/HF_TOKEN")
+                    return
+                continue
+            failures = 0
+            while not self.stop_event.is_set():
+                try:
+                    self.queue.put(obj, timeout=1.0)
+                    break
+                except queue.Full:
+                    pass
+
+    def get(self, timeout: float = 900.0):
+        waited = 0.0
+        while True:
+            try:
+                return self.queue.get(timeout=5.0)
+            except queue.Empty:
+                if self.fatal is not None:
+                    raise self.fatal
+                waited += 5.0
+                if waited >= timeout:
+                    raise RuntimeError("Timed out waiting for the next object")
+
 
 class CompleteObjaverseDataset(IterableDataset):
-    def __init__(
-        self,
-        name: str = "zeyuanyin/complete-objaverse",
-        split: str = "train",
-        image_size: int = 224,
-        config_name=None,
-        image_keys=("image_png",),
-        num_workers=None,
-        num_views: int = 12,
-        checkpoint_dir=None,
-    ):
+    """Infinite stream of (input view, target views) pairs.
+
+    Keeps `pool_size` objects in memory and draws random samples across them,
+    so every batch mixes several objects. Use with DataLoader(num_workers=0).
+    """
+
+    def __init__(self, name: str, shards: list, image_size: int = 224,
+                 num_target_views: int = 2, pool_size: int = 8,
+                 samples_per_object: int = 48, prefetch: int = 4,
+                 same_view_prob: float = 0.1, preloaded_objects=None, **_ignored):
         super().__init__()
         self.name = name
-        self.num_views = max(2, int(num_views))
-        self.num_target_views = self.num_views - 1
-        self.image_size = int(image_size)
-        self.num_workers = 0
-        self.shards = _load_or_fetch_shards(name)
+        self.shards = shards
+        self.image_size = image_size
+        self.num_target_views = num_target_views
+        self.pool_size = pool_size
+        self.samples_per_object = samples_per_object
+        self.prefetch = prefetch
+        self.same_view_prob = same_view_prob
+        self.preloaded = preloaded_objects
 
-        self.resize = transforms.Resize((self.image_size, self.image_size))
-        self.to_tensor = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,) * 3, (0.5,) * 3),
-        ])
+    def __iter__(self):
+        feeder = None
+        if self.preloaded is not None:              # overfit/debug mode
+            pool = [[o, 0] for o in self.preloaded]
+        else:
+            progress = _load_progress()
+            start = int(progress.get("current_shard_index", 0)) % len(self.shards)
+            total = int(progress.get("total_shards_processed", 0))
+            feeder = _ObjectFeeder(self.name, self.shards, self.image_size,
+                                   start, total, self.prefetch)
+            feeder.start()
+            print(f"[ABD3D] Filling object pool ({self.pool_size} objects)...")
+            pool = [[feeder.get(), self.samples_per_object]
+                    for _ in range(self.pool_size)]
+            print("[ABD3D] Object pool ready ✅")
 
-    def _decode(self, payload) -> torch.Tensor | None:
-        if payload is None:
-            return None
-        try:
-            img = Image.open(io.BytesIO(payload))
-            if img.mode == "RGBA":
-                img = img.convert("RGB")
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
-            img = self.resize(img)
-            return self.to_tensor(img)
-        except Exception:
-            return None
-
-    def _samples_from_views(self, views: list[dict]) -> Iterator:
-        if len(views) < 2:
-            return
-
-        while len(views) < self.num_views:
-            views.append(views[-1])
-
-        for _ in range(max(16, len(views) * 4)):
-            input_idx = random.randrange(len(views))
-            all_idx = [i for i in range(len(views)) if i != input_idx]
-            target_idxs = random.sample(
-                all_idx, min(self.num_target_views, len(all_idx)))
-
-            while len(target_idxs) < self.num_target_views:
-                target_idxs.append(target_idxs[-1])
-
-            input_view = views[input_idx]["image"]
-            target_views = torch.stack(
-                [views[i]["image"] for i in target_idxs])
-            depth_maps = torch.stack(
-                [views[i]["depth"] for i in [input_idx, *target_idxs]])
-
-            yield {
-                "input_view": input_view,
-                "target_views": target_views,
-                "depth_maps": depth_maps,
-            }
-
-    def __iter__(self) -> Iterator:
-        if not self.shards:
-            raise ValueError(f"No shards found for '{self.name}'")
-
-        progress = _load_progress()
-        shard_index     = int(progress.get("current_shard_index", 0))
-        total_processed = int(progress.get("total_shards_processed", 0))
-
-        if shard_index >= len(self.shards):
-            shard_index = 0
-
-        shard_name = self.shards[shard_index]
-        print(f"[ABD3D] Loading shard {shard_index}/{len(self.shards)}: {shard_name}")
-
-        local_path = _download_shard(self.name, shard_name)
-        parquet = None
-
-        try:
-            parquet = pq.ParquetFile(local_path)
-            batch_size = max(32, self.num_views * 2)
-            pending_views = []
-            yielded = 0
-            total_rows = parquet.metadata.num_rows
-            for batch_index, batch in enumerate(
-                    parquet.iter_batches(
-                        batch_size=batch_size,
-                        columns=["image_png", "nd_png"]),
-                    start=1):
-                for row in batch.to_pylist():
-                    img = self._decode(row.get("image_png"))
-                    dep = self._decode(row.get("nd_png"))
-                    if img is not None and dep is not None:
-                        pending_views.append({"image": img, "depth": dep})
-
-                if batch_index == 1 or batch_index % 10 == 0:
-                    rows_read = min(batch_index * batch_size, total_rows)
-                    print(f"[ABD3D] Decoded rows {rows_read}/{total_rows}; "
-                          f"valid views buffered: {len(pending_views)}")
-
-                while len(pending_views) >= self.num_views:
-                    view_group = pending_views[:self.num_views]
-                    del pending_views[:self.num_views]
-                    for sample in self._samples_from_views(view_group):
-                        yield sample
-                        yielded += 1
-
-            for sample in self._samples_from_views(pending_views):
-                yield sample
-                yielded += 1
-
-            print(f"[ABD3D] Yielded {yielded} samples from shard ✅")
-
-        except Exception as e:
-            print(f"[ABD3D] Error reading shard {shard_name}: {e}")
-
-        finally:
-            if parquet is not None:
-                parquet.close()
-            if local_path.exists():
-                local_path.unlink()
-                print(f"[ABD3D] Deleted shard {shard_name} ✅")
-
-            next_index = (shard_index + 1) % len(self.shards)
-            _save_progress(next_index, total_processed + 1, shard_name)
-            print(f"[ABD3D] Advanced to shard {next_index}/{len(self.shards)}")
+        while True:
+            slot = random.randrange(len(pool))
+            yield make_sample(pool[slot][0], self.num_target_views,
+                              self.same_view_prob, random)
+            if feeder is not None:
+                pool[slot][1] -= 1
+                if pool[slot][1] <= 0:
+                    pool[slot] = [feeder.get(), self.samples_per_object]
 
 
 ObjaverseStreamingDataset = CompleteObjaverseDataset
-ShapeNetStreamingDataset  = CompleteObjaverseDataset
+ShapeNetStreamingDataset = CompleteObjaverseDataset

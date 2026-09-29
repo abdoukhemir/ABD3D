@@ -6,56 +6,72 @@ from pathlib import Path
 @dataclass
 class Config:
     seed: int = 42
+
+    # ---- model ----
     image_size: int = 224
     in_channels: int = 3
-    num_views: int = 12
     patch_size: int = 16
     embed_dim: int = 448
     encoder_depth: int = 8
     encoder_heads: int = 8
-    vae_latent_dim: int = 256
-    generator_depth: int = 9
+    generator_depth: int = 6
     generator_heads: int = 8
     triplane_channels: int = 32
-    triplane_size: int = 32
-    batch_size: int = 5
+    triplane_size: int = 32          # final plane resolution
+    triplane_token_size: int = 16    # token grid per plane (x2 upsampled -> triplane_size)
+    decoder_hidden_dim: int = 128
+
+    # ---- cameras / views (dataset: 48 views = 4 rings x 12 azimuths, ASSUMED) ----
+    num_rings: int = 4
+    views_per_ring: int = 12
+    ring_elevations_deg: tuple = (0.0, 30.0, 60.0, -30.0)  # initial guess, learnable
+    camera_radius: float = 2.0       # learnable
+    camera_fov_deg: float = 40.0     # learnable
+    scene_radius: float = 1.5        # ray near/far = radius -/+ scene_radius
+    azimuth_direction: float = 1.0   # set to -1.0 if renders look mirrored
+
+    # ---- rendering / supervision ----
+    render_size: int = 64
+    render_samples: int = 48
+    num_target_views: int = 2        # target views rendered per input view
+    same_view_prob: float = 0.1      # chance a target equals the input view
+
+    # ---- data ----
+    dataset_name: str = "zeyuanyin/complete-objaverse"
+    val_objects: int = 8
+    val_pairs_per_object: int = 2
+    pool_size: int = 8               # objects mixed together at any time
+    samples_per_object: int = 48     # samples drawn from an object before replacing it
+    prefetch_objects: int = 4
+    overfit_num_objects: int = 0     # >0: train on only this many objects (debug)
+
+    # ---- optimisation ----
+    batch_size: int = 4
     gradient_accumulation_steps: int = 2
-    num_workers: int = 0 if os.name == "nt" else 2
-    max_steps: int = 100_000
+    max_steps: int = 100_000         # optimizer updates
     learning_rate: float = 1e-4
-    weight_decay: float = 0.01
+    camera_lr_scale: float = 0.1
+    weight_decay: float = 0.05
     warmup_steps: int = 1_000
     grad_clip_norm: float = 1.0
+    mixed_precision: bool = True
 
-    # ✅ Mathematically justified loss weights
-    mse_weight:   float = 1.0
-    lpips_weight: float = 0.06   # ✅ was 0.1 — 15% gradient contribution
-    kl_weight:    float = 1e-3   # ✅ was 1e-4 — 5% gradient contribution
+    # ---- loss ----
+    mse_weight: float = 1.0
+    alpha_weight: float = 1.0
+    lpips_weight: float = 0.5
+    lpips_warmup_steps: int = 1_000
+    lpips_views: int = 4             # rendered views used for LPIPS per micro-batch
+    fg_weight: float = 4.0           # extra MSE weight on object pixels
 
-    # ✅ KL Annealing — prevents posterior collapse
-    kl_warmup_steps: int = 5000  # steps to reach full kl_weight
-
-    # ✅ Adaptive weight settings
-    adaptive_weights: bool = True
-    adaptive_interval: int = 1000
-    adaptive_beta: float = 0.9
-    lpips_min_weight: float = 0.01
-    lpips_max_weight: float = 0.2   # ✅ was 0.3
-    kl_min_weight: float = 1e-4
-    kl_max_weight: float = 1e-2    # ✅ was 1e-1 (too high)
-
-    # ✅ ReduceLROnPlateau settings
-    lr_patience: int = 1000
-    lr_factor: float = 0.5
-    lr_min: float = 1e-7
-
+    # ---- logging / checkpoints ----
+    log_every: int = 10
+    val_interval_steps: int = 500
+    run_name: str = "abd3d-triplane-v2"
     checkpoint_interval_minutes: int = 10
     checkpoint_dir: Path = Path("checkpoints")
-    dataset_name: str = "zeyuanyin/complete-objaverse"
-    dataset_config: str | None = None
-    dataset_split: str = "train"
-    image_keys: tuple[str, ...] = ("image_png", "image", "render", "front_image")
-    mixed_precision: bool = True
+    backup_dir: str | None = "/kaggle/working/abd3d-checkpoints"
+    require_multi_gpu: bool = False
     device: str = "cuda"
 
     @property
@@ -63,10 +79,7 @@ class Config:
         return "cuda" if self.device == "cuda" else "cpu"
 
     def apply_memory_budget(self) -> None:
-        if os.name == "nt":
-            self.num_workers = 0
-        if self.device_type == "cuda":
-            self.batch_size = min(self.batch_size, 8)
+        return None
 
 
 DEFAULT_CONFIG = Config()
