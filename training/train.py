@@ -373,6 +373,9 @@ def train(config: Config, resume=None) -> None:
     dataloader = get_fresh_dataloader(config)
     iterator   = iter(dataloader)
     step       = start_step
+    consecutive_data_errors = 0
+    consecutive_empty_shards = 0
+    iterator_had_batch = False
 
     print(f"[ABD3D] Training: step {step} → {config.max_steps} 🚀")
     print(f"[ABD3D] KL Annealing: 0 → full over {config.kl_warmup_steps} steps ✅")
@@ -382,17 +385,39 @@ def train(config: Config, resume=None) -> None:
     while step < config.max_steps:
 
         try:
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Fetching batch...",
+                  flush=True)
             batch = next(iterator)
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Batch ready ✅",
+                  flush=True)
         except StopIteration:
+            if not iterator_had_batch:
+                consecutive_empty_shards += 1
+                if consecutive_empty_shards >= len(dataloader.dataset.shards):
+                    raise RuntimeError(
+                        "Every dataset shard produced zero training batches")
+            else:
+                consecutive_empty_shards = 0
             print(f"[ABD3D] Shard done → next shard (step {step})")
             dataloader = get_fresh_dataloader(config)
             iterator   = iter(dataloader)
+            iterator_had_batch = False
             continue
         except Exception as e:
+            consecutive_data_errors += 1
             print(f"[ABD3D] Error: {e} → reloading...")
+            if consecutive_data_errors >= 5:
+                raise RuntimeError(
+                    "Data loading failed 5 times in a row; "
+                    "stopping instead of retrying indefinitely") from e
             dataloader = get_fresh_dataloader(config)
             iterator   = iter(dataloader)
+            iterator_had_batch = False
             continue
+
+        iterator_had_batch = True
+        consecutive_data_errors = 0
+        consecutive_empty_shards = 0
 
         input_view   = batch["input_view"].to(device, non_blocking=True)
         target_views = batch["target_views"].to(device, non_blocking=True)
@@ -446,9 +471,13 @@ def train(config: Config, resume=None) -> None:
 
         if time.monotonic() - last_checkpoint >= \
                 config.checkpoint_interval_minutes * 60:
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Saving checkpoint...",
+                  flush=True)
             save_step_checkpoint(
                 config.checkpoint_dir, model, optimizer,
                 scaler, scheduler, step + 1, adaptive)
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Checkpoint done ✅",
+                  flush=True)
             last_checkpoint = time.monotonic()
 
         gpu_mem    = sum(
@@ -464,6 +493,8 @@ def train(config: Config, resume=None) -> None:
 
         if use_wandb:
             import wandb
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} Logging to WandB...",
+                  flush=True)
             wandb.log({
                 "loss":              total_loss,
                 "mse":               mse_val,
@@ -478,6 +509,8 @@ def train(config: Config, resume=None) -> None:
                 "effective_kl_w":    kl_w * kl_warmup_factor,
                 "step":              step,
             })
+            print(f"[ABD3D] {time.strftime('%H:%M:%S')} WandB done ✅",
+                  flush=True)
 
         print(f"Step {step}/{config.max_steps - 1} | "
               f"Loss: {total_loss:.4f} | "

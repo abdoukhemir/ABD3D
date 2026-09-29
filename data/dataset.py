@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import pandas as pd
+import pyarrow.parquet as pq
 import requests
 import torch
 from huggingface_hub import HfApi
@@ -103,7 +103,9 @@ def _download_shard(repo_id: str, shard_name: str) -> Path:
             response.raise_for_status()
 
             last_byte_time = time.monotonic()
+            last_report_time = last_byte_time
             bytes_written  = 0
+            total_bytes = response.headers.get("Content-Length")
 
             with open(local_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=65536):
@@ -112,10 +114,17 @@ def _download_shard(repo_id: str, shard_name: str) -> Path:
                         bytes_written  += len(chunk)
                         last_byte_time  = time.monotonic()
 
-                    elapsed = time.monotonic() - last_byte_time
+                    now = time.monotonic()
+                    elapsed = now - last_byte_time
                     if elapsed > stall_timeout:
                         raise TimeoutError(
                             f"Stalled {elapsed:.0f}s with no bytes")
+                    if now - last_report_time >= 10:
+                        total = f"/{int(total_bytes) / 1e6:.1f}MB" \
+                            if total_bytes else ""
+                        print(f"[ABD3D] Download progress: "
+                              f"{bytes_written / 1e6:.1f}MB{total}")
+                        last_report_time = now
 
             print(f"[ABD3D] Downloaded {bytes_written / 1e6:.1f}MB ✅")
             return local_path
@@ -186,6 +195,34 @@ class CompleteObjaverseDataset(IterableDataset):
         except Exception:
             return None
 
+    def _samples_from_views(self, views: list[dict]) -> Iterator:
+        if len(views) < 2:
+            return
+
+        while len(views) < self.num_views:
+            views.append(views[-1])
+
+        for _ in range(max(16, len(views) * 4)):
+            input_idx = random.randrange(len(views))
+            all_idx = [i for i in range(len(views)) if i != input_idx]
+            target_idxs = random.sample(
+                all_idx, min(self.num_target_views, len(all_idx)))
+
+            while len(target_idxs) < self.num_target_views:
+                target_idxs.append(target_idxs[-1])
+
+            input_view = views[input_idx]["image"]
+            target_views = torch.stack(
+                [views[i]["image"] for i in target_idxs])
+            depth_maps = torch.stack(
+                [views[i]["depth"] for i in [input_idx, *target_idxs]])
+
+            yield {
+                "input_view": input_view,
+                "target_views": target_views,
+                "depth_maps": depth_maps,
+            }
+
     def __iter__(self) -> Iterator:
         if not self.shards:
             raise ValueError(f"No shards found for '{self.name}'")
@@ -201,50 +238,39 @@ class CompleteObjaverseDataset(IterableDataset):
         print(f"[ABD3D] Loading shard {shard_index}/{len(self.shards)}: {shard_name}")
 
         local_path = _download_shard(self.name, shard_name)
+        parquet = None
 
         try:
-            df = pd.read_parquet(local_path)
-
-            if "view_id" in df.columns:
-                df = df.sort_values("view_id").reset_index(drop=True)
-
-            views = []
-            for _, row in df.iterrows():
-                img = self._decode(row.get("image_png"))
-                dep = self._decode(row.get("nd_png"))
-                if img is not None and dep is not None:
-                    views.append({"image": img, "depth": dep})
-
-            print(f"[ABD3D] {len(views)} valid views in shard")
-
-            if len(views) < 2:
-                return
-
-            while len(views) < self.num_views:
-                views.append(views[-1])
-
-            num_samples = max(16, len(views) * 4)
+            parquet = pq.ParquetFile(local_path)
+            batch_size = max(32, self.num_views * 2)
+            pending_views = []
             yielded = 0
-            for _ in range(num_samples):
-                input_idx = random.randrange(len(views))
-                all_idx = [i for i in range(len(views)) if i != input_idx]
-                target_idxs = random.sample(
-                    all_idx, min(self.num_target_views, len(all_idx)))
+            total_rows = parquet.metadata.num_rows
+            for batch_index, batch in enumerate(
+                    parquet.iter_batches(
+                        batch_size=batch_size,
+                        columns=["image_png", "nd_png"]),
+                    start=1):
+                for row in batch.to_pylist():
+                    img = self._decode(row.get("image_png"))
+                    dep = self._decode(row.get("nd_png"))
+                    if img is not None and dep is not None:
+                        pending_views.append({"image": img, "depth": dep})
 
-                while len(target_idxs) < self.num_target_views:
-                    target_idxs.append(target_idxs[-1])
+                if batch_index == 1 or batch_index % 10 == 0:
+                    rows_read = min(batch_index * batch_size, total_rows)
+                    print(f"[ABD3D] Decoded rows {rows_read}/{total_rows}; "
+                          f"valid views buffered: {len(pending_views)}")
 
-                input_view  = views[input_idx]["image"]
-                target_views = torch.stack(
-                    [views[i]["image"] for i in target_idxs])
-                depth_maps  = torch.stack(
-                    [views[i]["depth"] for i in [input_idx, *target_idxs]])
+                while len(pending_views) >= self.num_views:
+                    view_group = pending_views[:self.num_views]
+                    del pending_views[:self.num_views]
+                    for sample in self._samples_from_views(view_group):
+                        yield sample
+                        yielded += 1
 
-                yield {
-                    "input_view":   input_view,
-                    "target_views": target_views,
-                    "depth_maps":   depth_maps,
-                }
+            for sample in self._samples_from_views(pending_views):
+                yield sample
                 yielded += 1
 
             print(f"[ABD3D] Yielded {yielded} samples from shard ✅")
@@ -253,6 +279,8 @@ class CompleteObjaverseDataset(IterableDataset):
             print(f"[ABD3D] Error reading shard {shard_name}: {e}")
 
         finally:
+            if parquet is not None:
+                parquet.close()
             if local_path.exists():
                 local_path.unlink()
                 print(f"[ABD3D] Deleted shard {shard_name} ✅")
