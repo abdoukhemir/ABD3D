@@ -69,8 +69,8 @@ def main() -> None:
         return
 
     # ✅ Pass resume flag directly — train() finds checkpoint automatically
-        train(config, resume=args.resume,
-                    require_multi_gpu=args.require_multi_gpu)
+    train(config, resume=args.resume,
+          require_multi_gpu=args.require_multi_gpu)
 
 
 if __name__ == "__main__":
