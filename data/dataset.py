@@ -74,14 +74,6 @@ def _save_progress(index: int, total: int, name: str) -> None:
 
 
 def _download_shard(repo_id: str, shard_name: str) -> Path:
-    """
-    Download shard using requests with:
-    - Stall detection (30s no bytes = retry)
-    - Auto retry up to 5 times
-    - Exponential backoff between retries
-    - Token authentication
-    - Never hangs forever ✅
-    """
     local_path = CACHE_DIR / Path(shard_name).name
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -94,15 +86,14 @@ def _download_shard(repo_id: str, shard_name: str) -> Path:
            f"/resolve/main/{shard_name}")
     headers = {"Authorization": f"Bearer {token}"}
 
-    max_retries  = 5
-    stall_timeout = 30  # seconds with no bytes = stalled
+    max_retries   = 5
+    stall_timeout = 30
 
     for attempt in range(max_retries):
         try:
             print(f"[ABD3D] Downloading: {shard_name} "
                   f"(attempt {attempt + 1}/{max_retries})")
 
-            # ✅ connect timeout=10s, read timeout=30s
             response = requests.get(
                 url,
                 headers=headers,
@@ -121,7 +112,6 @@ def _download_shard(repo_id: str, shard_name: str) -> Path:
                         bytes_written  += len(chunk)
                         last_byte_time  = time.monotonic()
 
-                    # ✅ Stall detection
                     elapsed = time.monotonic() - last_byte_time
                     if elapsed > stall_timeout:
                         raise TimeoutError(
@@ -132,19 +122,29 @@ def _download_shard(repo_id: str, shard_name: str) -> Path:
 
         except Exception as e:
             print(f"[ABD3D] Download error: {e}")
-
-            # Clean up partial file
             if local_path.exists():
                 local_path.unlink()
-
             if attempt < max_retries - 1:
-                wait = 10 * (attempt + 1)  # 10s, 20s, 30s, 40s
+                wait = 10 * (attempt + 1)
                 print(f"[ABD3D] Retrying in {wait}s...")
                 time.sleep(wait)
-            else:
-                raise RuntimeError(
-                    f"[ABD3D] Failed after {max_retries} attempts: {shard_name}")
 
+    # ✅ All retries failed → skip this shard and advance to next
+    print(f"[ABD3D] ⚠️ All {max_retries} attempts failed for {shard_name}")
+    print(f"[ABD3D] Skipping shard and advancing to next...")
+    
+    # Advance progress to next shard
+    progress = _load_progress()
+    current_index = int(progress.get("current_shard_index", 0))
+    total = int(progress.get("total_shards_processed", 0))
+    
+    # Load shard list to find next index
+    shards = json.loads(SHARD_LIST_FILE.read_text(encoding="utf-8"))
+    next_index = (current_index + 1) % len(shards)
+    _save_progress(next_index, total + 1, shard_name)
+    print(f"[ABD3D] Advanced to shard {next_index}/{len(shards)}")
+    
+    raise RuntimeError(f"Skipped shard {shard_name} after {max_retries} failures")
 
 class CompleteObjaverseDataset(IterableDataset):
     def __init__(
