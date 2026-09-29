@@ -93,7 +93,6 @@ class AdaptiveWeights:
         self.kl_min    = config.kl_min_weight
         self.kl_max    = config.kl_max_weight
 
-        # Smoothed loss history
         self.mse_ema   = None
         self.lpips_ema = None
         self.kl_ema    = None
@@ -103,12 +102,8 @@ class AdaptiveWeights:
         self.prev_kl    = None
 
     def update(self, mse: float, lpips: float, kl: float, step: int) -> bool:
-        """
-        Update EMAs. Returns True when weights are recalculated.
-        """
         b = self.beta
 
-        # Update EMAs
         self.mse_ema   = mse   if self.mse_ema   is None else b * self.mse_ema   + (1-b) * mse
         self.lpips_ema = lpips if self.lpips_ema is None else b * self.lpips_ema + (1-b) * lpips
         self.kl_ema    = kl    if self.kl_ema    is None else b * self.kl_ema    + (1-b) * kl
@@ -122,32 +117,25 @@ class AdaptiveWeights:
             self.prev_kl    = self.kl_ema
             return False
 
-        # Rate of change (negative = improving)
         d_mse   = self.mse_ema   - self.prev_mse
         d_lpips = self.lpips_ema - self.prev_lpips
-        d_kl    = self.kl_ema    - self.prev_kl
 
-        # ✅ If LPIPS not improving → reduce its weight
+        # ✅ LPIPS adaptation
         if d_lpips > 0:
             self.lpips_w = max(self.lpips_w * 0.8, self.lpips_min)
         elif d_lpips < -0.01:
             self.lpips_w = min(self.lpips_w * 1.1, self.lpips_max)
 
-        # ✅ If KL too low → increase its weight
-        
-
+        # ✅ KL adaptation with aggressive posterior collapse detection
         if self.kl_ema is not None and self.kl_ema < 0.0001:
-   
-             self.kl_w = min(self.kl_w * 10.0, self.kl_max)
-             print(f"[ABD3D] ⚠️ Posterior collapse! KL≈0 → KL weight × 10 = {self.kl_w:.2e}")
+            self.kl_w = min(self.kl_w * 10.0, self.kl_max)
+            print(f"[ABD3D] ⚠️ Posterior collapse! KL≈0 → KL weight × 10 = {self.kl_w:.2e}")
         elif self.kl_ema is not None and self.kl_ema < 0.001:
-    
-             self.kl_w = min(self.kl_w * 3.0, self.kl_max)
+            self.kl_w = min(self.kl_w * 3.0, self.kl_max)
         elif self.kl_ema is not None and self.kl_ema > 0.1:
-    
-             self.kl_w = max(self.kl_w * 0.5, self.kl_min)
+            self.kl_w = max(self.kl_w * 0.5, self.kl_min)
 
-        # ✅ If MSE fighting LPIPS (MSE going up) → reduce LPIPS
+        # ✅ MSE vs LPIPS conflict detection
         if d_mse > 0 and d_lpips < 0:
             self.lpips_w = max(self.lpips_w * 0.7, self.lpips_min)
 
@@ -175,14 +163,13 @@ def save_checkpoint(path: Path, model, optimizer, scaler,
         "scaler":    scaler.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "step":      step,
-        # ✅ Save adaptive weights so they survive resume
         "adaptive": {
-            "mse_w":    adaptive.mse_w,
-            "lpips_w":  adaptive.lpips_w,
-            "kl_w":     adaptive.kl_w,
-            "mse_ema":  adaptive.mse_ema,
-            "lpips_ema":adaptive.lpips_ema,
-            "kl_ema":   adaptive.kl_ema,
+            "mse_w":     adaptive.mse_w,
+            "lpips_w":   adaptive.lpips_w,
+            "kl_w":      adaptive.kl_w,
+            "mse_ema":   adaptive.mse_ema,
+            "lpips_ema": adaptive.lpips_ema,
+            "kl_ema":    adaptive.kl_ema,
         } if adaptive is not None else None,
     }, path)
 
@@ -294,7 +281,6 @@ def train(config: Config, resume=None) -> None:
         "cuda",
         enabled=config.mixed_precision and device.type == "cuda")
 
-    # ✅ ReduceLROnPlateau — auto-reduces LR when loss plateaus
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -303,7 +289,6 @@ def train(config: Config, resume=None) -> None:
         min_lr=config.lr_min,
     )
 
-    # ✅ Adaptive loss weights
     adaptive = AdaptiveWeights(config) if config.adaptive_weights else None
 
     lpips_metric = None
@@ -316,22 +301,22 @@ def train(config: Config, resume=None) -> None:
     except ImportError:
         print("[ABD3D] LPIPS unavailable ⚠️")
 
-    # ✅ WandB Init
     use_wandb = False
     try:
         import wandb
         wandb.init(
             project="ABD3D",
-            name=f"session-step-{resume or 0}",
+            name=f"fresh-start-kl-annealing",
             config={
-                "batch_size":    config.batch_size,
-                "learning_rate": config.learning_rate,
-                "num_views":     config.num_views,
-                "mse_weight":    config.mse_weight,
-                "lpips_weight":  config.lpips_weight,
-                "kl_weight":     config.kl_weight,
-                "image_size":    config.image_size,
-                "adaptive":      config.adaptive_weights,
+                "batch_size":       config.batch_size,
+                "learning_rate":    config.learning_rate,
+                "num_views":        config.num_views,
+                "mse_weight":       config.mse_weight,
+                "lpips_weight":     config.lpips_weight,
+                "kl_weight":        config.kl_weight,
+                "kl_warmup_steps":  config.kl_warmup_steps,
+                "image_size":       config.image_size,
+                "adaptive":         config.adaptive_weights,
             },
             resume="allow",
         )
@@ -358,24 +343,22 @@ def train(config: Config, resume=None) -> None:
                 try:
                     scheduler.load_state_dict(state["scheduler"])
                 except Exception:
-                    pass  # scheduler type changed — start fresh
+                    pass
             start_step = state.get("step", 0)
 
-            # ✅ Restore adaptive weights if available
             if adaptive is not None and state.get("adaptive"):
                 a = state["adaptive"]
-                adaptive.mse_w    = a.get("mse_w",    config.mse_weight)
-                adaptive.lpips_w  = a.get("lpips_w",  config.lpips_weight)
-                adaptive.kl_w     = a.get("kl_w",     config.kl_weight)
-                adaptive.mse_ema  = a.get("mse_ema")
-                adaptive.lpips_ema= a.get("lpips_ema")
-                adaptive.kl_ema   = a.get("kl_ema")
+                adaptive.mse_w     = a.get("mse_w",    config.mse_weight)
+                adaptive.lpips_w   = a.get("lpips_w",  config.lpips_weight)
+                adaptive.kl_w      = a.get("kl_w",     config.kl_weight)
+                adaptive.mse_ema   = a.get("mse_ema")
+                adaptive.lpips_ema = a.get("lpips_ema")
+                adaptive.kl_ema    = a.get("kl_ema")
                 print(f"[ABD3D] Adaptive weights restored: "
                       f"MSE={adaptive.mse_w:.3f} "
                       f"LPIPS={adaptive.lpips_w:.3f} "
                       f"KL={adaptive.kl_w:.2e} ✅")
 
-            # ✅ Force new LR from config
             for param_group in optimizer.param_groups:
                 param_group['lr'] = config.learning_rate
             print(f"[ABD3D] LR forced to: {config.learning_rate} ✅")
@@ -392,9 +375,9 @@ def train(config: Config, resume=None) -> None:
     step       = start_step
 
     print(f"[ABD3D] Training: step {step} → {config.max_steps} 🚀")
+    print(f"[ABD3D] KL Annealing: 0 → full over {config.kl_warmup_steps} steps ✅")
     if adaptive:
-        print(f"[ABD3D] Adaptive weights ON "
-              f"(interval={config.adaptive_interval} steps) ✅")
+        print(f"[ABD3D] Adaptive weights ON (interval={config.adaptive_interval} steps) ✅")
 
     while step < config.max_steps:
 
@@ -426,10 +409,8 @@ def train(config: Config, resume=None) -> None:
             mse        = nn.functional.mse_loss(pred_views, target_views)
             kl         = ImageVAE.kl_divergence(output["mu"], output["logvar"])
 
-        # ✅ LPIPS outside autocast
         perceptual = _lpips_loss(pred_views, target_views, lpips_metric)
 
-        # ✅ Get current weights (adaptive or fixed)
         if adaptive is not None:
             changed = adaptive.update(mse.item(), perceptual.item(), kl.item(), step)
             mse_w, lpips_w, kl_w = adaptive.weights
@@ -443,10 +424,13 @@ def train(config: Config, resume=None) -> None:
             lpips_w = config.lpips_weight
             kl_w    = config.kl_weight
 
+        # ✅ KL Annealing — prevents posterior collapse
+        kl_warmup_factor = min(1.0, step / max(1, config.kl_warmup_steps))
+
         loss = (
             mse_w   * mse +
             lpips_w * perceptual +
-            kl_w    * kl
+            kl_w    * kl_warmup_factor * kl
         ) / config.gradient_accumulation_steps
 
         scaler.scale(loss).backward()
@@ -458,8 +442,6 @@ def train(config: Config, resume=None) -> None:
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
-            # ✅ ReduceLROnPlateau needs the loss value
             scheduler.step(loss.item())
 
         if time.monotonic() - last_checkpoint >= \
@@ -483,16 +465,18 @@ def train(config: Config, resume=None) -> None:
         if use_wandb:
             import wandb
             wandb.log({
-                "loss":          total_loss,
-                "mse":           mse_val,
-                "lpips":         lpips_val,
-                "kl":            kl_val,
-                "learning_rate": lr_val,
-                "gpu_gb":        gpu_mem,
-                "mse_weight":    mse_w,
-                "lpips_weight":  lpips_w,
-                "kl_weight":     kl_w,
-                "step":          step,
+                "loss":              total_loss,
+                "mse":               mse_val,
+                "lpips":             lpips_val,
+                "kl":                kl_val,
+                "learning_rate":     lr_val,
+                "gpu_gb":            gpu_mem,
+                "mse_weight":        mse_w,
+                "lpips_weight":      lpips_w,
+                "kl_weight":         kl_w,
+                "kl_warmup_factor":  kl_warmup_factor,
+                "effective_kl_w":    kl_w * kl_warmup_factor,
+                "step":              step,
             })
 
         print(f"Step {step}/{config.max_steps - 1} | "
@@ -500,6 +484,7 @@ def train(config: Config, resume=None) -> None:
               f"MSE: {mse_val:.4f} | "
               f"LPIPS: {lpips_val:.4f} | "
               f"KL: {kl_val:.4f} | "
+              f"KLw: {kl_warmup_factor:.2f} | "
               f"LR: {lr_val:.2e} | "
               f"W: {mse_w:.2f}/{lpips_w:.3f}/{kl_w:.0e} | "
               f"GPU: {gpu_mem:.1f}GB")

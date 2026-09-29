@@ -22,29 +22,32 @@ class Config:
     gradient_accumulation_steps: int = 2
     num_workers: int = 0 if os.name == "nt" else 2
     max_steps: int = 100_000
-    learning_rate: float = 1e-4        # ✅ increased from 2e-5
+    learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 1_000
     grad_clip_norm: float = 1.0
 
-    # ✅ Starting weights — will adapt dynamically during training
+    # ✅ Mathematically justified loss weights
     mse_weight:   float = 1.0
-    lpips_weight: float = 0.1
-    kl_weight:    float = 1e-4         # ✅ increased from 1e-5
+    lpips_weight: float = 0.06   # ✅ was 0.1 — 15% gradient contribution
+    kl_weight:    float = 1e-3   # ✅ was 1e-4 — 5% gradient contribution
+
+    # ✅ KL Annealing — prevents posterior collapse
+    kl_warmup_steps: int = 5000  # steps to reach full kl_weight
 
     # ✅ Adaptive weight settings
-    adaptive_weights: bool = True       # enable dynamic loss weights
-    adaptive_interval: int = 1000        # recalculate every 200 steps
-    adaptive_beta: float = 0.9          # smoothing factor (0=no smooth, 1=full smooth)
-    lpips_min_weight: float = 0.01     # LPIPS never goes below this
-    lpips_max_weight: float = 0.3      # LPIPS never goes above this
-    kl_min_weight: float = 1e-5        # KL never goes below this
-    kl_max_weight: float = 1e-1        # KL never goes above this
+    adaptive_weights: bool = True
+    adaptive_interval: int = 1000
+    adaptive_beta: float = 0.9
+    lpips_min_weight: float = 0.01
+    lpips_max_weight: float = 0.2   # ✅ was 0.3
+    kl_min_weight: float = 1e-4
+    kl_max_weight: float = 1e-2    # ✅ was 1e-1 (too high)
 
     # ✅ ReduceLROnPlateau settings
-    lr_patience: int = 1000             # steps before reducing LR
-    lr_factor: float = 0.5             # reduce LR by 50%
-    lr_min: float = 1e-7               # minimum LR
+    lr_patience: int = 1000
+    lr_factor: float = 0.5
+    lr_min: float = 1e-7
 
     checkpoint_interval_minutes: int = 10
     checkpoint_dir: Path = Path("checkpoints")
