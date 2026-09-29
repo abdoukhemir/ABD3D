@@ -68,17 +68,11 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     orig_device = prediction.device
     prediction = prediction.detach().float().reshape(-1, *prediction.shape[-3:])
     target = target.detach().float().reshape(-1, *target.shape[-3:])
-    chunk_size = 8
-    loss_sum = torch.zeros((), device=orig_device)
-    with torch.no_grad():
-        for start in range(0, prediction.shape[0], chunk_size):
-            end = min(start + chunk_size, prediction.shape[0])
-            chunk_loss = metric(
-                prediction[start:end].mul(2).sub(1),
-                target[start:end].mul(2).sub(1),
-            ).reshape(end - start, -1).mean(dim=1)
-            loss_sum += chunk_loss.sum()
-    return loss_sum / prediction.shape[0]
+    loss = metric(
+        prediction.mul(2).sub(1),
+        target.mul(2).sub(1)
+    ).mean()
+    return loss.to(orig_device)
 
 
 class AdaptiveWeights:
@@ -249,7 +243,7 @@ def get_fresh_dataloader(config: Config) -> DataLoader:
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=0)
 
 
-def train(config: Config, resume=None, require_multi_gpu: bool = False) -> None:
+def train(config: Config, resume=None) -> None:
     config.checkpoint_dir = resolve_checkpoint_dir(config.checkpoint_dir)
     print(f"[ABD3D] checkpoint_dir={config.checkpoint_dir}")
     torch.manual_seed(config.seed)
@@ -267,21 +261,12 @@ def train(config: Config, resume=None, require_multi_gpu: bool = False) -> None:
         num_gpus = 0
         print("[ABD3D] WARNING: No GPU — using CPU ⚠️")
 
-    if require_multi_gpu and num_gpus < 2:
-        raise RuntimeError(
-            f"Multi-GPU training requested, but only {num_gpus} CUDA GPU(s) "
-            "are visible. Set CUDA_VISIBLE_DEVICES to include both GPUs.")
-
     base_model = ABD3DModel(config).to(device)
     total_params = sum(p.numel() for p in base_model.parameters()) / 1e6
     print(f"[ABD3D] Model: {total_params:.1f}M parameters")
 
     if num_gpus > 1:
-        model = nn.DataParallel(
-            base_model,
-            device_ids=list(range(num_gpus)),
-            output_device=0,
-        )
+        model = nn.DataParallel(base_model)
         print(f"[ABD3D] DataParallel across {num_gpus} GPUs 🔥")
     else:
         model = base_model
