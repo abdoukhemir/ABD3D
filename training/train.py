@@ -68,11 +68,17 @@ def _lpips_loss(prediction, target, metric) -> torch.Tensor:
     orig_device = prediction.device
     prediction = prediction.detach().float().reshape(-1, *prediction.shape[-3:])
     target = target.detach().float().reshape(-1, *target.shape[-3:])
-    loss = metric(
-        prediction.mul(2).sub(1),
-        target.mul(2).sub(1)
-    ).mean()
-    return loss.to(orig_device)
+    chunk_size = 8
+    loss_sum = torch.zeros((), device=orig_device)
+    with torch.no_grad():
+        for start in range(0, prediction.shape[0], chunk_size):
+            end = min(start + chunk_size, prediction.shape[0])
+            chunk_loss = metric(
+                prediction[start:end].mul(2).sub(1),
+                target[start:end].mul(2).sub(1),
+            ).reshape(end - start, -1).mean(dim=1)
+            loss_sum += chunk_loss.sum()
+    return loss_sum / prediction.shape[0]
 
 
 class AdaptiveWeights:
