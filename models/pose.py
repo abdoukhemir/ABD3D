@@ -63,7 +63,7 @@ class OrbitCamera(nn.Module):
         azimuth, ring = view_id_to_angles(
             view_ids, self.views_per_ring, self.azimuth_direction)
         ring = ring.clamp(0, self.num_rings - 1)
-        elevation = self.ring_elevation[ring].clamp(-1.4, 1.4)
+        elevation = self.ring_elevation[ring].clamp(-1.56, 1.56)
         radius = self.log_radius.exp()
 
         cos_el = torch.cos(elevation)

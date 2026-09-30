@@ -24,9 +24,9 @@ class Config:
     # ---- cameras / views (dataset: 48 views = 4 rings x 12 azimuths, ASSUMED) ----
     num_rings: int = 4
     views_per_ring: int = 12
-    ring_elevations_deg: tuple = (0.0, 30.0, 60.0, -30.0)  # initial guess, learnable
-    camera_radius: float = 2.0       # learnable
-    camera_fov_deg: float = 40.0     # learnable
+    ring_elevations_deg: tuple = (0.0, 30.0, 60.0, 89.0)
+    camera_radius: float = 1.6       # learnable
+    camera_fov_deg: float = 50.0     # learnable
     scene_radius: float = 1.5        # ray near/far = radius -/+ scene_radius
     azimuth_direction: float = 1.0   # set to -1.0 if renders look mirrored
 
@@ -52,7 +52,7 @@ class Config:
     learning_rate: float = 1e-4
     camera_lr_scale: float = 0.1
     weight_decay: float = 0.05
-    warmup_steps: int = 1_000
+    warmup_steps: int = 200
     grad_clip_norm: float = 1.0
     mixed_precision: bool = True
 
